@@ -3,6 +3,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import authRouter from './routes/auth.js';
+import projectsRouter from './routes/projects.js';
 import { sendSuccess, sendError } from './utils/response.js';
 import { db } from './db/index.js';
 import { sql } from 'drizzle-orm';
@@ -39,8 +40,9 @@ app.use(requestLogger);
 app.use(express.json());
 app.use(cookieParser());
 
-// Mount authentication and user profile routes
+// Mount API routes
 app.use('/api/v1', authRouter);
+app.use('/api/v1', projectsRouter);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
