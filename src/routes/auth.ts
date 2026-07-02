@@ -1,0 +1,291 @@
+import { Router, Response } from 'express';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { users } from '../db/schema.js';
+import {
+  hashPassword,
+  comparePassword,
+  generateAccessToken,
+  generateRefreshToken,
+  verifyRefreshToken
+} from '../utils/auth.js';
+import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+
+const router = Router();
+
+// Helper to set refresh token cookie
+const setRefreshTokenCookie = (res: Response, token: string) => {
+  res.cookie('refreshToken', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  });
+};
+
+// POST /auth/register
+router.post('/auth/register', async (req, res) => {
+  console.log(`[POST] /auth/register request received for email: ${req.body?.email}`);
+  try {
+    const { name, email, password, businessName, invitedBy } = req.body;
+
+    // 1. Validation
+    const fields: Record<string, string> = {};
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      fields.name = 'Name is required';
+    }
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      fields.email = 'Email is required';
+    }
+    // Password is optional; validate only if provided
+    if (password !== undefined && password !== null) {
+      if (typeof password !== 'string' || password.length < 8) {
+        fields.password = 'Password must be at least 8 characters';
+      }
+    }
+
+    if (Object.keys(fields).length > 0) {
+      return sendError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Validation failed',
+        fields,
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // 2. Check if user already exists
+    const [existingUser] = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, cleanEmail))
+      .limit(1);
+
+    if (existingUser) {
+      return sendError(res, 409, {
+        code: 'CONFLICT',
+        message: 'An account with this email already exists',
+      });
+    }
+
+    // 3. Hash password (if provided) & prepare data
+    const passwordHash = password ? await hashPassword(password) : null;
+
+    // 4. Insert user
+    const [newUser] = await db
+      .insert(users)
+      .values({
+        name: name.trim(),
+        email: cleanEmail,
+        passwordHash,
+        businessName: businessName?.trim() || null,
+        invitedBy: invitedBy || null,
+      })
+      .returning();
+
+    // 5. Generate tokens
+    const tokenPayload = { userId: newUser.id, email: newUser.email };
+    const accessToken = generateAccessToken(tokenPayload);
+    const refreshToken = generateRefreshToken(tokenPayload);
+
+    // 6. Set cookie & return response
+    setRefreshTokenCookie(res, refreshToken);
+
+    const { passwordHash: _, ...userWithoutPassword } = newUser;
+    return sendSuccess(res, 201, {
+      user: userWithoutPassword,
+      accessToken,
+    }, 'User registered successfully');
+  } catch (error) {
+    console.error('Registration error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred during registration',
+    });
+  }
+});
+
+// POST /auth/login
+router.post('/auth/login', async (req, res) => {
+  console.log(`[POST] /auth/login request received for email: ${req.body?.email}`);
+  try {
+    const { email, password } = req.body;
+
+    // 1. Validation
+    const fields: Record<string, string> = {};
+    if (!email || typeof email !== 'string') {
+      fields.email = 'Email is required';
+    }
+    if (!password || typeof password !== 'string') {
+      fields.password = 'Password is required';
+    }
+
+    if (Object.keys(fields).length > 0) {
+      return sendError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Validation failed',
+        fields,
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // 2. Fetch user
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, cleanEmail))
+      .limit(1);
+
+    if (!user) {
+      return sendError(res, 401, {
+        code: 'INVALID_CREDENTIALS',
+        message: 'Invalid email or password',
+      });
+    }
+
+    // Check if the user has a password set (since password is optional on register/invitation)
+    if (!user.passwordHash) {
+      return sendError(res, 401, {
+        code: 'PASSWORD_NOT_SET',
+        message: 'Password has not been set for this account. Please set a password or use the invitation link.',
+      });
+    }
+
+    // 3. Verify password
+    const isPasswordValid = await comparePassword(password, user.passwordHash);
+    if (!isPasswordValid) {
+      return sendError(res, 401, {
+        code: 'INVALID_CREDENTIALS',
+        message: 'Invalid email or password',
+      });
+    }
+
+    // 4. Generate tokens
+    const tokenPayload = { userId: user.id, email: user.email };
+    const accessToken = generateAccessToken(tokenPayload);
+    const refreshToken = generateRefreshToken(tokenPayload);
+
+    // 5. Set cookie & return response
+    setRefreshTokenCookie(res, refreshToken);
+
+    const { passwordHash: _, ...userWithoutPassword } = user;
+    return sendSuccess(res, 200, {
+      user: userWithoutPassword,
+      accessToken,
+    }, 'Logged in successfully');
+  } catch (error) {
+    console.error('Login error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred during login',
+    });
+  }
+});
+
+// POST /auth/refresh
+router.post('/auth/refresh', async (req, res) => {
+  console.log('[POST] /auth/refresh request received');
+  try {
+    const refreshToken = req.cookies?.refreshToken;
+
+    if (!refreshToken) {
+      return sendError(res, 401, {
+        code: 'UNAUTHORIZED',
+        message: 'Refresh token is missing',
+      });
+    }
+
+    // 1. Verify token
+    let payload;
+    try {
+      payload = verifyRefreshToken(refreshToken);
+    } catch (err) {
+      return sendError(res, 401, {
+        code: 'UNAUTHORIZED',
+        message: 'Refresh token is invalid or expired',
+      });
+    }
+
+    // 2. Look up user
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, payload.userId))
+      .limit(1);
+
+    if (!user) {
+      return sendError(res, 401, {
+        code: 'UNAUTHORIZED',
+        message: 'User no longer exists',
+      });
+    }
+
+    // 3. Rotate tokens (generate new access and refresh tokens)
+    const tokenPayload = { userId: user.id, email: user.email };
+    const newAccessToken = generateAccessToken(tokenPayload);
+    const newRefreshToken = generateRefreshToken(tokenPayload);
+
+    setRefreshTokenCookie(res, newRefreshToken);
+
+    return sendSuccess(res, 200, {
+      accessToken: newAccessToken,
+    }, 'Token refreshed successfully');
+  } catch (error) {
+    console.error('Refresh token error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred during token refresh',
+    });
+  }
+});
+
+// POST /auth/logout
+router.post('/auth/logout', (req, res) => {
+  res.clearCookie('refreshToken', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+  });
+  return sendSuccess(res, 200, {}, 'Logged out successfully');
+});
+
+// GET /me
+router.get('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return sendError(res, 401, {
+        code: 'UNAUTHORIZED',
+        message: 'User identity could not be verified',
+      });
+    }
+
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+
+    if (!user) {
+      return sendError(res, 404, {
+        code: 'NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+
+    const { passwordHash: _, ...userWithoutPassword } = user;
+    return sendSuccess(res, 200, {
+      user: userWithoutPassword,
+    }, 'User profile fetched successfully');
+  } catch (error) {
+    console.error('Get profile error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred fetching profile',
+    });
+  }
+});
+
+export default router;
