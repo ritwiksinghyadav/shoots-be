@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { eq, and, asc, inArray } from 'drizzle-orm';
+import { eq, and, asc, inArray, ne, gte, lte } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { projects, shootDays, shootMembers, expenses, users } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
@@ -45,6 +45,69 @@ function shapeProject(
 
 // Apply auth middleware to all project routes
 router.use(requireAuth);
+
+// GET /projects/upcoming-days — fetch shoot days between today and one month from today
+router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const now = new Date();
+    const todayStr = now.toISOString().split('T')[0];
+
+    const oneMonthLater = new Date();
+    oneMonthLater.setMonth(oneMonthLater.getMonth() + 1);
+    const oneMonthLaterStr = oneMonthLater.toISOString().split('T')[0];
+
+    const rows = await db
+      .select({
+        shootDay: shootDays,
+        project: projects,
+        ownerName: users.name,
+      })
+      .from(shootDays)
+      .innerJoin(projects, eq(shootDays.projectId, projects.id))
+      .innerJoin(users, eq(projects.ownerId, users.id))
+      .where(
+        and(
+          eq(projects.ownerId, userId),
+          gte(shootDays.date, todayStr),
+          lte(shootDays.date, oneMonthLaterStr),
+          ne(projects.status, 'done'),
+          ne(projects.status, 'cancelled')
+        )
+      )
+      .orderBy(asc(shootDays.date), asc(shootDays.time));
+
+    const result = rows.map((row) => {
+      const shapedDay = shapeShootDay(row.shootDay);
+      return {
+        shoot: {
+          id: row.project.id,
+          ownerId: row.project.ownerId,
+          ownerName: row.ownerName ?? userId,
+          title: row.project.title,
+          client: row.project.client,
+          status: row.project.status,
+          budget: row.project.budget,
+          emoji: row.project.icon ?? '📸',
+          notes: row.project.notes ?? '',
+          category: 'editorial',
+          coverColor: '#7C3AED',
+          team: [],
+          expenses: [],
+          shootDays: [shapedDay],
+        },
+        shootDay: shapedDay,
+      };
+    });
+
+    return sendSuccess(res, 200, { shootDays: result }, 'Upcoming shoot days fetched successfully');
+  } catch (error) {
+    console.error('Error fetching upcoming shoot days:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch upcoming shoot days' });
+  }
+});
 
 // POST /projects — create project + shoot days atomically
 router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
