@@ -170,12 +170,8 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     const id = String(req.params.id);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Fetch project
     const [projectData] = await db
-      .select({
-        project: projects,
-        ownerName: users.name,
-      })
+      .select({ project: projects, ownerName: users.name })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
       .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
@@ -185,20 +181,18 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
     }
 
-    // Fetch relations
-    const days = await db.select().from(shootDays).where(eq(shootDays.projectId, id));
-    const members = await db.select().from(shootMembers).where(eq(shootMembers.projectId, id));
-    const projectExpenses = await db.select().from(expenses).where(eq(expenses.projectId, id));
+    const days = await db
+      .select()
+      .from(shootDays)
+      .where(eq(shootDays.projectId, id))
+      .orderBy(asc(shootDays.shootOrder));
 
-    const result = {
-      ...projectData.project,
-      ownerName: projectData.ownerName,
-      shootDays: days,
-      team: members,
-      expenses: projectExpenses,
-    };
-
-    return sendSuccess(res, 200, { project: result }, 'Project fetched successfully');
+    return sendSuccess(
+      res,
+      200,
+      { project: shapeProject(projectData.project, projectData.ownerName ?? userId, days) },
+      'Project fetched successfully'
+    );
   } catch (error) {
     console.error('Error fetching project:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch project' });
@@ -214,9 +208,26 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
 
     const { title, client, status, budget, icon, notes } = req.body;
 
-    const [updatedProject] = await db.update(projects)
+    // Validate required fields
+    const fields: Record<string, string> = {};
+    if (title !== undefined && (!title || typeof title !== 'string' || !title.trim()))
+      fields.title = 'Title cannot be empty';
+    if (client !== undefined && (!client || typeof client !== 'string' || !client.trim()))
+      fields.client = 'Client cannot be empty';
+    if (budget !== undefined && (isNaN(Number(budget)) || Number(budget) < 0))
+      fields.budget = 'Budget must be a valid number';
+    if (Object.keys(fields).length > 0)
+      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
+
+    const [updatedProject] = await db
+      .update(projects)
       .set({
-        title, client, status, budget, icon, notes,
+        ...(title !== undefined && { title: title.trim() }),
+        ...(client !== undefined && { client: client.trim() }),
+        ...(status !== undefined && { status }),
+        ...(budget !== undefined && { budget: Number(budget) }),
+        ...(icon !== undefined && { icon }),
+        ...(notes !== undefined && { notes: notes.trim() }),
         updatedAt: new Date(),
       })
       .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
@@ -226,7 +237,25 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
     }
 
-    return sendSuccess(res, 200, { project: updatedProject }, 'Project updated successfully');
+    // Re-fetch shoot days to return a fully shaped project
+    const days = await db
+      .select()
+      .from(shootDays)
+      .where(eq(shootDays.projectId, id))
+      .orderBy(asc(shootDays.shootOrder));
+
+    const [owner] = await db
+      .select({ name: users.name })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+
+    return sendSuccess(
+      res,
+      200,
+      { project: shapeProject(updatedProject, owner?.name ?? userId, days) },
+      'Project updated successfully'
+    );
   } catch (error) {
     console.error('Error updating project:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to update project' });
