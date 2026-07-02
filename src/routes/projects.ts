@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { eq, and, asc, inArray, ne, gte, lte } from 'drizzle-orm';
+import { eq, and, asc, inArray, ne, gte, lte, like } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { projects, shootDays, shootMembers, expenses, users } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
@@ -106,6 +106,68 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
   } catch (error) {
     console.error('Error fetching upcoming shoot days:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch upcoming shoot days' });
+  }
+});
+
+// GET /projects/shoot-days — fetch shoot days for a specific year and month (0-indexed)
+router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const year = parseInt(req.query.year as string, 10);
+    const month = parseInt(req.query.month as string, 10); // 0-indexed
+
+    if (isNaN(year) || isNaN(month)) {
+      return sendError(res, 400, { code: 'BAD_REQUEST', message: 'Year and month are required query parameters' });
+    }
+
+    const prefix = `${year}-${String(month + 1).padStart(2, '0')}`;
+
+    const rows = await db
+      .select({
+        shootDay: shootDays,
+        project: projects,
+        ownerName: users.name,
+      })
+      .from(shootDays)
+      .innerJoin(projects, eq(shootDays.projectId, projects.id))
+      .innerJoin(users, eq(projects.ownerId, users.id))
+      .where(
+        and(
+          eq(projects.ownerId, userId),
+          like(shootDays.date, `${prefix}%`)
+        )
+      )
+      .orderBy(asc(shootDays.date), asc(shootDays.time));
+
+    const result = rows.map((row) => {
+      const shapedDay = shapeShootDay(row.shootDay);
+      return {
+        shoot: {
+          id: row.project.id,
+          ownerId: row.project.ownerId,
+          ownerName: row.ownerName ?? userId,
+          title: row.project.title,
+          client: row.project.client,
+          status: row.project.status,
+          budget: row.project.budget,
+          emoji: row.project.icon ?? '📸',
+          notes: row.project.notes ?? '',
+          category: 'editorial',
+          coverColor: '#7C3AED',
+          team: [],
+          expenses: [],
+          shootDays: [shapedDay],
+        },
+        shootDay: shapedDay,
+      };
+    });
+
+    return sendSuccess(res, 200, { shootDays: result }, 'Shoot days fetched successfully');
+  } catch (error) {
+    console.error('Error fetching shoot days for month:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch shoot days' });
   }
 });
 
