@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import { eq, and, asc, inArray, ne, gte, lte, like } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { projects, shootDays, shootMembers, expenses, users } from '../db/schema.js';
+import { projects, shootDays, shootMembers, expenses, users, teamMembers } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 
@@ -19,11 +19,49 @@ function shapeShootDay(d: typeof shootDays.$inferSelect) {
   };
 }
 
+const AVATAR_COLORS = [
+  '#7C3AED', // Violet
+  '#0284C7', // Sky
+  '#059669', // Emerald
+  '#DB2777', // Pink
+  '#EA580C', // Orange
+  '#2563EB', // Blue
+  '#D97706', // Amber
+  '#4F46E5', // Indigo
+];
+
+function getAvatarColor(email: string) {
+  let hash = 0;
+  for (let i = 0; i < email.length; i++) {
+    hash = email.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const index = Math.abs(hash) % AVATAR_COLORS.length;
+  return AVATAR_COLORS[index];
+}
+
+function getInitials(nameOrEmail: string) {
+  const clean = nameOrEmail.split('@')[0].trim();
+  const parts = clean.split(/[\s._-]+/);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return clean.slice(0, 2).toUpperCase();
+}
+
 function shapeProject(
   p: typeof projects.$inferSelect,
   ownerName: string,
   days: (typeof shootDays.$inferSelect)[],
-  exps: (typeof expenses.$inferSelect)[] = []
+  exps: (typeof expenses.$inferSelect)[] = [],
+  team: {
+    id: string;
+    userId: string | null;
+    name: string | null;
+    email: string | null;
+    payment: number;
+    paymentStatus: string;
+    invited: boolean;
+  }[] = []
 ) {
   return {
     id: p.id,
@@ -35,10 +73,23 @@ function shapeProject(
     budget: p.budget,
     emoji: p.icon ?? '📸',
     notes: p.notes ?? '',
-    // Stubs for features not yet in DB
     category: 'editorial' as const,
     coverColor: '#7C3AED',
-    team: [],
+    team: team.map((t) => {
+      const email = t.email ?? '';
+      const name = t.name || null;
+      return {
+        id: t.id,
+        userId: t.userId,
+        name,
+        email,
+        initials: getInitials(name || email),
+        payment: t.payment,
+        paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+        invited: t.invited,
+        avatarColor: getAvatarColor(email),
+      };
+    }),
     expenses: exps.map((e) => ({
       id: e.id,
       label: e.label,
@@ -242,7 +293,7 @@ router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
     return sendSuccess(
       res,
       201,
-      { project: shapeProject(newProject, owner?.name ?? userId, insertedDays, []) },
+      { project: shapeProject(newProject, owner?.name ?? userId, insertedDays, [], []) },
       'Project created successfully'
     );
   } catch (error) {
@@ -257,12 +308,29 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // 1. Fetch projects + owner name
-    const rows = await db
+    // Fetch projects owned by user OR projects where user is a team member
+    const ownedProjects = await db
       .select({ project: projects, ownerName: users.name })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
       .where(eq(projects.ownerId, userId));
+
+    const memberProjects = await db
+      .select({ project: projects, ownerName: users.name })
+      .from(projects)
+      .innerJoin(users, eq(projects.ownerId, users.id))
+      .innerJoin(shootMembers, eq(projects.id, shootMembers.projectId))
+      .where(eq(shootMembers.userId, userId));
+
+    // Combine and deduplicate
+    const seenIds = new Set<string>();
+    const rows = [];
+    for (const r of [...ownedProjects, ...memberProjects]) {
+      if (!seenIds.has(r.project.id)) {
+        seenIds.add(r.project.id);
+        rows.push(r);
+      }
+    }
 
     if (rows.length === 0) {
       return sendSuccess(res, 200, { projects: [] }, 'Projects fetched successfully');
@@ -297,13 +365,37 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       expensesByProject.get(exp.projectId)!.push(exp);
     }
 
+    // Fetch all shoot members for those projects in one query
+    const allMembers = await db
+      .select({
+        id: shootMembers.id,
+        projectId: shootMembers.projectId,
+        userId: shootMembers.userId,
+        name: users.name,
+        email: users.email,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+        invited: shootMembers.invited,
+      })
+      .from(shootMembers)
+      .leftJoin(users, eq(shootMembers.userId, users.id))
+      .where(inArray(shootMembers.projectId, projectIds));
+
+    // Group members by project
+    const membersByProject = new Map<string, typeof allMembers>();
+    for (const m of allMembers) {
+      if (!membersByProject.has(m.projectId)) membersByProject.set(m.projectId, []);
+      membersByProject.get(m.projectId)!.push(m);
+    }
+
     // 4. Shape & return
     const shaped = rows.map((r) =>
       shapeProject(
         r.project,
         r.ownerName ?? userId,
         daysByProject.get(r.project.id) ?? [],
-        expensesByProject.get(r.project.id) ?? []
+        expensesByProject.get(r.project.id) ?? [],
+        membersByProject.get(r.project.id) ?? []
       )
     );
 
@@ -321,7 +413,8 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     const id = String(req.params.id);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    const [projectData] = await db
+    // Check if user is owner
+    let [projectData] = await db
       .select({ project: projects, ownerName: users.name })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
@@ -329,7 +422,24 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .limit(1);
 
     if (!projectData) {
-      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+      // Check if user is a shoot member
+      const [isMember] = await db
+        .select()
+        .from(shootMembers)
+        .where(and(eq(shootMembers.projectId, id), eq(shootMembers.userId, userId)))
+        .limit(1);
+
+      if (!isMember) {
+        return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+      }
+
+      // Fetch project details for crew
+      [projectData] = await db
+        .select({ project: projects, ownerName: users.name })
+        .from(projects)
+        .innerJoin(users, eq(projects.ownerId, users.id))
+        .where(eq(projects.id, id))
+        .limit(1);
     }
 
     const days = await db
@@ -344,10 +454,24 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .where(eq(expenses.projectId, id))
       .orderBy(asc(expenses.createdAt));
 
+    const members = await db
+      .select({
+        id: shootMembers.id,
+        userId: shootMembers.userId,
+        name: users.name,
+        email: users.email,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+        invited: shootMembers.invited,
+      })
+      .from(shootMembers)
+      .leftJoin(users, eq(shootMembers.userId, users.id))
+      .where(eq(shootMembers.projectId, id));
+
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(projectData.project, projectData.ownerName ?? userId, days, exps) },
+      { project: shapeProject(projectData.project, projectData.ownerName ?? userId, days, exps, members) },
       'Project fetched successfully'
     );
   } catch (error) {
@@ -413,10 +537,24 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .where(eq(users.id, userId))
       .limit(1);
 
+    const members = await db
+      .select({
+        id: shootMembers.id,
+        userId: shootMembers.userId,
+        name: users.name,
+        email: users.email,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+        invited: shootMembers.invited,
+      })
+      .from(shootMembers)
+      .leftJoin(users, eq(shootMembers.userId, users.id))
+      .where(eq(shootMembers.projectId, id));
+
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(updatedProject, owner?.name ?? userId, days, exps) },
+      { project: shapeProject(updatedProject, owner?.name ?? userId, days, exps, members) },
       'Project updated successfully'
     );
   } catch (error) {
@@ -614,28 +752,210 @@ router.post('/projects/:projectId/expenses', async (req: AuthenticatedRequest, r
   }
 });
 
-// DELETE /projects/:projectId/expenses/:expenseId
-router.delete('/projects/:projectId/expenses/:expenseId', async (req: AuthenticatedRequest, res: Response) => {
+// ─── Team Members / Crew Endpoints ──────────────────────────────────────────
+
+// POST /projects/:projectId/members
+router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     const projectId = String(req.params.projectId);
-    const expenseId = String(req.params.expenseId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
     // Validate project ownership
     const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
     if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
 
-    const [deletedExpense] = await db.delete(expenses)
-      .where(and(eq(expenses.id, expenseId), eq(expenses.projectId, projectId)))
+    let emails: string[] = [];
+    const { email, emails: bodyEmails, payment, paymentStatus, invited } = req.body;
+
+    if (Array.isArray(bodyEmails)) {
+      emails = bodyEmails;
+    } else if (email && typeof email === 'string') {
+      emails = [email];
+    }
+
+    if (emails.length === 0) {
+      return sendError(res, 400, { code: 'BAD_REQUEST', message: 'Valid email or emails array is required' });
+    }
+
+    const results = [];
+
+    for (const rawEmail of emails) {
+      if (typeof rawEmail !== 'string' || !rawEmail.includes('@')) continue;
+      const targetEmail = rawEmail.trim().toLowerCase();
+
+      // 1. Search for user by email
+      let [targetUser] = await db.select().from(users).where(eq(users.email, targetEmail)).limit(1);
+
+      if (!targetUser) {
+        // 1.1 Create user if not in database
+        const [newUser] = await db.insert(users).values({
+          email: targetEmail,
+          invitedBy: userId,
+        }).returning();
+        targetUser = newUser;
+      }
+
+      // 2. Check if already a member of this project
+      const [existingMember] = await db.select().from(shootMembers).where(and(
+        eq(shootMembers.projectId, projectId),
+        eq(shootMembers.userId, targetUser.id)
+      )).limit(1);
+
+      if (existingMember) {
+        continue;
+      }
+
+      // 3. Map user with project
+      const [newMember] = await db.insert(shootMembers).values({
+        projectId,
+        userId: targetUser.id,
+        payment: Number(payment) || 0,
+        paymentStatus: paymentStatus === 'paid' ? 'paid' : 'unpaid',
+        invited: invited !== undefined ? invited : true,
+      }).returning();
+
+      // 4. Add to owner's teamMembers list (if not already there)
+      const [existingTeamMember] = await db.select().from(teamMembers).where(and(
+        eq(teamMembers.userId, userId),
+        eq(teamMembers.memberId, targetUser.id)
+      )).limit(1);
+
+      if (!existingTeamMember) {
+        await db.insert(teamMembers).values({
+          userId,
+          memberId: targetUser.id,
+        });
+      }
+
+      results.push({
+        id: newMember.id,
+        userId: targetUser.id,
+        name: targetUser.name || null,
+        email: targetUser.email,
+        initials: getInitials(targetUser.name || targetUser.email),
+        payment: newMember.payment,
+        paymentStatus: (newMember.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+        invited: newMember.invited,
+        avatarColor: getAvatarColor(targetUser.email),
+      });
+    }
+
+    return sendSuccess(res, 201, { members: results }, 'Team member(s) added successfully');
+  } catch (error) {
+    console.error('Error adding project member:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to add project member' });
+  }
+});
+
+// PUT /projects/:projectId/members/:memberId
+router.put('/projects/:projectId/members/:memberId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const memberId = String(req.params.memberId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // Validate project ownership
+    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
+    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+
+    const { payment, paymentStatus, invited } = req.body;
+
+    const [updatedMember] = await db.update(shootMembers)
+      .set({
+        ...(payment !== undefined && { payment: Number(payment) }),
+        ...(paymentStatus !== undefined && { paymentStatus }),
+        ...(invited !== undefined && { invited }),
+        updatedAt: new Date()
+      })
+      .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId)))
       .returning();
 
-    if (!deletedExpense) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Expense not found' });
+    if (!updatedMember) {
+      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Member not found' });
+    }
 
-    return sendSuccess(res, 200, {}, 'Expense deleted successfully');
+    // Fetch user details for response
+    const [user] = await db.select({
+      name: users.name,
+      email: users.email,
+    }).from(users).where(eq(users.id, updatedMember.userId!)).limit(1);
+
+    const shapedMember = {
+      id: updatedMember.id,
+      userId: updatedMember.userId,
+      name: user?.name || null,
+      email: user?.email ?? '',
+      initials: getInitials((user?.name || user?.email) ?? ''),
+      payment: updatedMember.payment,
+      paymentStatus: (updatedMember.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+      invited: updatedMember.invited,
+      avatarColor: getAvatarColor(user?.email ?? ''),
+    };
+
+    return sendSuccess(res, 200, { member: shapedMember }, 'Team member updated successfully');
   } catch (error) {
-    console.error('Error deleting expense:', error);
-    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete expense' });
+    console.error('Error updating project member:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to update project member' });
+  }
+});
+
+// DELETE /projects/:projectId/members/:memberId
+router.delete('/projects/:projectId/members/:memberId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const memberId = String(req.params.memberId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // Validate project ownership
+    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
+    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+
+    const [deletedMember] = await db.delete(shootMembers)
+      .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId)))
+      .returning();
+
+    if (!deletedMember) {
+      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Member not found' });
+    }
+
+    return sendSuccess(res, 200, {}, 'Team member removed successfully');
+  } catch (error) {
+    console.error('Error deleting project member:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete project member' });
+  }
+});
+
+// GET /team-members — fetch all team members for Quick Add Crew and homepage counts
+router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const rows = await db
+      .select({
+        id: users.id,
+        name: users.name,
+        email: users.email,
+      })
+      .from(teamMembers)
+      .innerJoin(users, eq(teamMembers.memberId, users.id))
+      .where(eq(teamMembers.userId, userId));
+
+    const result = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      initials: getInitials(r.name || r.email),
+      avatarColor: getAvatarColor(r.email),
+    }));
+
+    return sendSuccess(res, 200, { teamMembers: result }, 'Team members fetched successfully');
+  } catch (error) {
+    console.error('Error fetching team members:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch team members' });
   }
 });
 

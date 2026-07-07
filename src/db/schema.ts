@@ -1,8 +1,8 @@
-import { pgTable, uuid, text, smallint, boolean, timestamp, AnyPgColumn, integer, jsonb } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, smallint, boolean, timestamp, AnyPgColumn, integer, jsonb, unique } from 'drizzle-orm/pg-core';
 
 export const users = pgTable('users', {
   id: uuid('id').defaultRandom().primaryKey(),
-  name: text('name').notNull(),
+  name: text('name'),
   email: text('email').notNull().unique(),
   passwordHash: text('password_hash'),
   businessName: text('business_name'),
@@ -42,7 +42,7 @@ export const shootMembers = pgTable('shoot_members', {
   id: uuid('id').defaultRandom().primaryKey(),
   projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   userId: uuid('user_id').references(() => users.id, { onDelete: 'set null' }),
-  paymentStatus: text('payment_status').notNull().default('pending'),
+  paymentStatus: text('payment_status').notNull().default('unpaid'),
   payment: integer('payment').notNull().default(0),
   invited: boolean('invited').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -59,3 +59,13 @@ export const expenses = pgTable('expenses', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const teamMembers = pgTable('team_members', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  memberId: uuid('member_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  unique().on(t.userId, t.memberId)
+]);
