@@ -22,7 +22,8 @@ function shapeShootDay(d: typeof shootDays.$inferSelect) {
 function shapeProject(
   p: typeof projects.$inferSelect,
   ownerName: string,
-  days: (typeof shootDays.$inferSelect)[]
+  days: (typeof shootDays.$inferSelect)[],
+  exps: (typeof expenses.$inferSelect)[] = []
 ) {
   return {
     id: p.id,
@@ -38,7 +39,13 @@ function shapeProject(
     category: 'editorial' as const,
     coverColor: '#7C3AED',
     team: [],
-    expenses: [],
+    expenses: exps.map((e) => ({
+      id: e.id,
+      label: e.label,
+      amount: e.amount,
+      category: (e.category ?? 'misc') as 'equipment' | 'travel' | 'food' | 'props' | 'venue' | 'misc',
+      date: e.date ?? undefined,
+    })),
     shootDays: days.map(shapeShootDay),
   };
 }
@@ -235,7 +242,7 @@ router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
     return sendSuccess(
       res,
       201,
-      { project: shapeProject(newProject, owner?.name ?? userId, insertedDays) },
+      { project: shapeProject(newProject, owner?.name ?? userId, insertedDays, []) },
       'Project created successfully'
     );
   } catch (error) {
@@ -276,9 +283,28 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       daysByProject.get(day.projectId)!.push(day);
     }
 
+    // Fetch all expenses for those projects in one query
+    const allExpenses = await db
+      .select()
+      .from(expenses)
+      .where(inArray(expenses.projectId, projectIds))
+      .orderBy(asc(expenses.createdAt));
+
+    // Group expenses by project
+    const expensesByProject = new Map<string, (typeof expenses.$inferSelect)[]>();
+    for (const exp of allExpenses) {
+      if (!expensesByProject.has(exp.projectId)) expensesByProject.set(exp.projectId, []);
+      expensesByProject.get(exp.projectId)!.push(exp);
+    }
+
     // 4. Shape & return
     const shaped = rows.map((r) =>
-      shapeProject(r.project, r.ownerName ?? userId, daysByProject.get(r.project.id) ?? [])
+      shapeProject(
+        r.project,
+        r.ownerName ?? userId,
+        daysByProject.get(r.project.id) ?? [],
+        expensesByProject.get(r.project.id) ?? []
+      )
     );
 
     return sendSuccess(res, 200, { projects: shaped }, 'Projects fetched successfully');
@@ -312,10 +338,16 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .where(eq(shootDays.projectId, id))
       .orderBy(asc(shootDays.shootOrder));
 
+    const exps = await db
+      .select()
+      .from(expenses)
+      .where(eq(expenses.projectId, id))
+      .orderBy(asc(expenses.createdAt));
+
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(projectData.project, projectData.ownerName ?? userId, days) },
+      { project: shapeProject(projectData.project, projectData.ownerName ?? userId, days, exps) },
       'Project fetched successfully'
     );
   } catch (error) {
@@ -369,6 +401,12 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .where(eq(shootDays.projectId, id))
       .orderBy(asc(shootDays.shootOrder));
 
+    const exps = await db
+      .select()
+      .from(expenses)
+      .where(eq(expenses.projectId, id))
+      .orderBy(asc(expenses.createdAt));
+
     const [owner] = await db
       .select({ name: users.name })
       .from(users)
@@ -378,7 +416,7 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(updatedProject, owner?.name ?? userId, days) },
+      { project: shapeProject(updatedProject, owner?.name ?? userId, days, exps) },
       'Project updated successfully'
     );
   } catch (error) {
@@ -492,6 +530,112 @@ router.delete('/projects/:projectId/days/:dayId', async (req: AuthenticatedReque
   } catch (error) {
     console.error('Error deleting shoot day:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete shoot day' });
+  }
+});
+
+// GET /projects/:projectId/expenses
+router.get('/projects/:projectId/expenses', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // Validate project ownership
+    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
+    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+
+    const exps = await db
+      .select()
+      .from(expenses)
+      .where(eq(expenses.projectId, projectId))
+      .orderBy(asc(expenses.createdAt));
+
+    const shapedExpenses = exps.map((e) => ({
+      id: e.id,
+      label: e.label,
+      amount: e.amount,
+      category: (e.category ?? 'misc') as 'equipment' | 'travel' | 'food' | 'props' | 'venue' | 'misc',
+      date: e.date ?? undefined,
+    }));
+
+    return sendSuccess(res, 200, { expenses: shapedExpenses }, 'Expenses fetched successfully');
+  } catch (error) {
+    console.error('Error fetching expenses:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch expenses' });
+  }
+});
+
+// POST /projects/:projectId/expenses
+router.post('/projects/:projectId/expenses', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // Validate project ownership
+    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
+    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+
+    const { label, amount, category, date } = req.body;
+
+    // Validation
+    const fields: Record<string, string> = {};
+    if (!label || typeof label !== 'string' || !label.trim()) {
+      fields.label = 'Label is required';
+    }
+    if (amount === undefined || amount === null || isNaN(Number(amount)) || Number(amount) <= 0) {
+      fields.amount = 'A valid positive amount is required';
+    }
+
+    if (Object.keys(fields).length > 0) {
+      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
+    }
+
+    const [newExpense] = await db.insert(expenses).values({
+      projectId,
+      label: label.trim(),
+      amount: Number(amount),
+      category: category || 'misc',
+      date: date && typeof date === 'string' && date.trim() ? date.trim() : null,
+    }).returning();
+
+    const shapedExpense = {
+      id: newExpense.id,
+      label: newExpense.label,
+      amount: newExpense.amount,
+      category: (newExpense.category ?? 'misc') as 'equipment' | 'travel' | 'food' | 'props' | 'venue' | 'misc',
+      date: newExpense.date ?? undefined,
+    };
+
+    return sendSuccess(res, 201, { expense: shapedExpense }, 'Expense added successfully');
+  } catch (error) {
+    console.error('Error adding expense:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to add expense' });
+  }
+});
+
+// DELETE /projects/:projectId/expenses/:expenseId
+router.delete('/projects/:projectId/expenses/:expenseId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const expenseId = String(req.params.expenseId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // Validate project ownership
+    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
+    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+
+    const [deletedExpense] = await db.delete(expenses)
+      .where(and(eq(expenses.id, expenseId), eq(expenses.projectId, projectId)))
+      .returning();
+
+    if (!deletedExpense) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Expense not found' });
+
+    return sendSuccess(res, 200, {}, 'Expense deleted successfully');
+  } catch (error) {
+    console.error('Error deleting expense:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete expense' });
   }
 });
 

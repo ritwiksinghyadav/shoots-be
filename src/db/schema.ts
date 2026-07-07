@@ -54,7 +54,8 @@ export const expenses = pgTable('expenses', {
   projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   label: text('label').notNull(),
   amount: integer('amount').notNull().default(0),
-  date: text('date').notNull(),
+  category: text('category').default('misc').notNull(),
+  date: text('date'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
