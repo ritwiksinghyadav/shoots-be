@@ -308,19 +308,90 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
+    // Parse Date & Timeframe filters
+    const { timeframe, startDate, endDate, year, month } = req.query;
+    let matchingProjectIds: string[] | null = null;
+
+    if (timeframe || startDate || endDate || year) {
+      const conditions = [];
+      const now = new Date();
+      const todayStr = now.toISOString().split('T')[0];
+
+      if (timeframe === 'upcoming_7') {
+        const nextWeek = new Date();
+        nextWeek.setDate(nextWeek.getDate() + 7);
+        const nextWeekStr = nextWeek.toISOString().split('T')[0];
+        conditions.push(gte(shootDays.date, todayStr));
+        conditions.push(lte(shootDays.date, nextWeekStr));
+      } else if (timeframe === 'upcoming_30') {
+        const nextMonth = new Date();
+        nextMonth.setDate(nextMonth.getDate() + 30);
+        const nextMonthStr = nextMonth.toISOString().split('T')[0];
+        conditions.push(gte(shootDays.date, todayStr));
+        conditions.push(lte(shootDays.date, nextMonthStr));
+      } else if (timeframe === 'past') {
+        conditions.push(lte(shootDays.date, todayStr));
+      } else if (timeframe === 'custom' || (!timeframe && (startDate || endDate))) {
+        if (startDate && typeof startDate === 'string') {
+          conditions.push(gte(shootDays.date, startDate));
+        }
+        if (endDate && typeof endDate === 'string') {
+          conditions.push(lte(shootDays.date, endDate));
+        }
+      }
+
+      if (year) {
+        const y = parseInt(year as string, 10);
+        if (!isNaN(y)) {
+          if (month) {
+            const m = parseInt(month as string, 10);
+            if (!isNaN(m)) {
+              const prefix = `${y}-${String(m).padStart(2, '0')}`;
+              conditions.push(like(shootDays.date, `${prefix}%`));
+            }
+          } else {
+            const prefix = `${y}-`;
+            conditions.push(like(shootDays.date, `${prefix}%`));
+          }
+        }
+      }
+
+      if (conditions.length > 0) {
+        const matchedDays = await db
+          .select({ projectId: shootDays.projectId })
+          .from(shootDays)
+          .where(and(...conditions));
+        
+        matchingProjectIds = Array.from(new Set(matchedDays.map((d) => d.projectId)));
+      }
+    }
+
+    const ownedConditions = [eq(projects.ownerId, userId)];
+    if (matchingProjectIds !== null) {
+      if (matchingProjectIds.length === 0) {
+        return sendSuccess(res, 200, { projects: [] }, 'Projects fetched successfully');
+      }
+      ownedConditions.push(inArray(projects.id, matchingProjectIds));
+    }
+
     // Fetch projects owned by user OR projects where user is a team member
     const ownedProjects = await db
       .select({ project: projects, ownerName: users.name })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
-      .where(eq(projects.ownerId, userId));
+      .where(and(...ownedConditions));
+
+    const memberConditions = [eq(shootMembers.userId, userId)];
+    if (matchingProjectIds !== null) {
+      memberConditions.push(inArray(projects.id, matchingProjectIds));
+    }
 
     const memberProjects = await db
       .select({ project: projects, ownerName: users.name })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
       .innerJoin(shootMembers, eq(projects.id, shootMembers.projectId))
-      .where(eq(shootMembers.userId, userId));
+      .where(and(...memberConditions));
 
     // Combine and deduplicate
     const seenIds = new Set<string>();
