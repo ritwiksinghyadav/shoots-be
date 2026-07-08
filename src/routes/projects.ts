@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { eq, and, asc, inArray, ne, gte, lte, like } from 'drizzle-orm';
+import { eq, and, or, asc, desc, inArray, ne, gte, lte, like, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { projects, shootDays, shootMembers, expenses, users, teamMembers } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
@@ -309,7 +309,7 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
     // Parse Date & Timeframe filters
-    const { timeframe, startDate, endDate, year, month } = req.query;
+    const { timeframe, startDate, endDate, year, month, status, q } = req.query;
     let matchingProjectIds: string[] | null = null;
 
     if (timeframe || startDate || endDate || year) {
@@ -366,49 +366,99 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       }
     }
 
-    const ownedConditions = [eq(projects.ownerId, userId)];
+    // Parse pagination parameters
+    const limit = parseInt(req.query.limit as string, 10) || 50;
+    const page = parseInt(req.query.page as string, 10) || 1;
+    const offset = (page - 1) * limit;
+
+    const baseConditions = [
+      or(
+        eq(projects.ownerId, userId),
+        eq(shootMembers.userId, userId)
+      )
+    ];
+
+    if (status && status !== 'all') {
+      baseConditions.push(eq(projects.status, status as string));
+    }
+
+    if (q && typeof q === 'string' && q.trim()) {
+      const searchPattern = `%${q.trim().toLowerCase()}%`;
+      baseConditions.push(
+        or(
+          like(sql`lower(${projects.title})`, searchPattern),
+          like(sql`lower(${projects.client})`, searchPattern),
+          like(sql`lower(${shootDays.locationJSON}->>'name')`, searchPattern)
+        )
+      );
+    }
+
     if (matchingProjectIds !== null) {
       if (matchingProjectIds.length === 0) {
-        return sendSuccess(res, 200, { projects: [] }, 'Projects fetched successfully');
+        return sendSuccess(
+          res,
+          200,
+          { projects: [], pagination: { total: 0, page, limit, pages: 0 } },
+          'Projects fetched successfully'
+        );
       }
-      ownedConditions.push(inArray(projects.id, matchingProjectIds));
+      baseConditions.push(inArray(projects.id, matchingProjectIds));
     }
 
-    // Fetch projects owned by user OR projects where user is a team member
-    const ownedProjects = await db
+    // Get total count of distinct projects
+    const countResult = await db
+      .select({ count: sql<number>`count(distinct ${projects.id})` })
+      .from(projects)
+      .leftJoin(shootMembers, eq(projects.id, shootMembers.projectId))
+      .leftJoin(shootDays, eq(projects.id, shootDays.projectId))
+      .where(and(...baseConditions));
+
+    const total = Number(countResult[0]?.count ?? 0);
+    const pages = Math.ceil(total / limit);
+
+    if (total === 0) {
+      return sendSuccess(
+        res,
+        200,
+        { projects: [], pagination: { total, page, limit, pages } },
+        'Projects fetched successfully'
+      );
+    }
+
+    // Fetch the project IDs for the current page
+    // We order them by the project creation date (createdAt) descending (latest created at the top)
+    const paginatedProjectIdsRows = await db
+      .select({
+        id: projects.id,
+      })
+      .from(projects)
+      .leftJoin(shootMembers, eq(projects.id, shootMembers.projectId))
+      .leftJoin(shootDays, eq(projects.id, shootDays.projectId))
+      .where(and(...baseConditions))
+      .groupBy(projects.id, projects.createdAt)
+      .orderBy(desc(projects.createdAt))
+      .limit(limit)
+      .offset(offset);
+
+    const projectIds = paginatedProjectIdsRows.map((r) => r.id);
+
+    if (projectIds.length === 0) {
+      return sendSuccess(
+        res,
+        200,
+        { projects: [], pagination: { total, page, limit, pages } },
+        'Projects fetched successfully'
+      );
+    }
+
+    // Fetch full projects details for these IDs only
+    const rows = await db
       .select({ project: projects, ownerName: users.name })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
-      .where(and(...ownedConditions));
-
-    const memberConditions = [eq(shootMembers.userId, userId)];
-    if (matchingProjectIds !== null) {
-      memberConditions.push(inArray(projects.id, matchingProjectIds));
-    }
-
-    const memberProjects = await db
-      .select({ project: projects, ownerName: users.name })
-      .from(projects)
-      .innerJoin(users, eq(projects.ownerId, users.id))
-      .innerJoin(shootMembers, eq(projects.id, shootMembers.projectId))
-      .where(and(...memberConditions));
-
-    // Combine and deduplicate
-    const seenIds = new Set<string>();
-    const rows = [];
-    for (const r of [...ownedProjects, ...memberProjects]) {
-      if (!seenIds.has(r.project.id)) {
-        seenIds.add(r.project.id);
-        rows.push(r);
-      }
-    }
-
-    if (rows.length === 0) {
-      return sendSuccess(res, 200, { projects: [] }, 'Projects fetched successfully');
-    }
+      .where(inArray(projects.id, projectIds));
 
     // 2. Fetch all shoot days for those projects in one query
-    const projectIds = rows.map((r) => r.project.id);
     const allDays = await db
       .select()
       .from(shootDays)
@@ -459,7 +509,7 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       membersByProject.get(m.projectId)!.push(m);
     }
 
-    // 4. Shape & return
+    // 4. Shape
     const shaped = rows.map((r) =>
       shapeProject(
         r.project,
@@ -470,7 +520,18 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       )
     );
 
-    return sendSuccess(res, 200, { projects: shaped }, 'Projects fetched successfully');
+    // Sort final shaped projects to match the order of projectIds
+    const shapedMap = new Map(shaped.map((p) => [p.id, p]));
+    const sortedShaped = projectIds
+      .map((id) => shapedMap.get(id))
+      .filter((p): p is NonNullable<typeof p> => p !== undefined);
+
+    return sendSuccess(
+      res,
+      200,
+      { projects: sortedShaped, pagination: { total, page, limit, pages } },
+      'Projects fetched successfully'
+    );
   } catch (error) {
     console.error('Error fetching projects:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch projects' });
@@ -1027,6 +1088,34 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
   } catch (error) {
     console.error('Error fetching team members:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch team members' });
+  }
+});
+
+// DELETE /projects/:id
+router.delete('/projects/:id', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const id = String(req.params.id);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // Validate project ownership (only owner can delete)
+    const [project] = await db
+      .select()
+      .from(projects)
+      .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
+      .limit(1);
+
+    if (!project) {
+      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found or you are not the owner' });
+    }
+
+    // Delete the project (associated shootDays, shootMembers, and expenses will cascade delete automatically)
+    await db.delete(projects).where(eq(projects.id, id));
+
+    return sendSuccess(res, 200, {}, 'Project deleted successfully');
+  } catch (error) {
+    console.error('Error deleting project:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete project' });
   }
 });
 
