@@ -4,6 +4,7 @@ import { db } from '../db/index.js';
 import { projects, shootDays, shootMembers, expenses, users, teamMembers } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
+import { sendInvitationEmail } from '../utils/email.js';
 
 const router = Router();
 
@@ -897,6 +898,16 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
     const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
     if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
 
+    // Fetch project owner and project shoot dates for the invitation email
+    const [owner] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const ownerName = owner?.name || owner?.email || 'Someone';
+
+    const days = await db
+      .select({ date: shootDays.date })
+      .from(shootDays)
+      .where(eq(shootDays.projectId, projectId));
+    const shootDates = days.map((d) => d.date);
+
     let emails: string[] = [];
     const { email, emails: bodyEmails, payment, paymentStatus, invited } = req.body;
 
@@ -918,6 +929,7 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
 
       // 1. Search for user by email
       let [targetUser] = await db.select().from(users).where(eq(users.email, targetEmail)).limit(1);
+      let isNewUser = false;
 
       if (!targetUser) {
         // 1.1 Create user if not in database
@@ -926,6 +938,13 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
           invitedBy: userId,
         }).returning();
         targetUser = newUser;
+        isNewUser = true;
+      }
+
+      if (isNewUser) {
+        sendInvitationEmail(targetEmail, ownerName, project.title, project.client, shootDates).catch((err) => {
+          console.error(`Failed to send invitation email to ${targetEmail}:`, err);
+        });
       }
 
       // 2. Check if already a member of this project
