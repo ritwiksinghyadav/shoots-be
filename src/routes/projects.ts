@@ -123,6 +123,7 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
         shootDay: shootDays,
         project: projects,
         ownerName: users.name,
+        ownerEmail: users.email,
       })
       .from(shootDays)
       .innerJoin(projects, eq(shootDays.projectId, projects.id))
@@ -174,7 +175,7 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
         shoot: {
           id: row.project.id,
           ownerId: row.project.ownerId,
-          ownerName: row.ownerName ?? userId,
+          ownerName: row.ownerName || row.ownerEmail || row.project.ownerId,
           title: row.project.title,
           client: row.project.client,
           status: row.project.status,
@@ -232,6 +233,7 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
         shootDay: shootDays,
         project: projects,
         ownerName: users.name,
+        ownerEmail: users.email,
       })
       .from(shootDays)
       .innerJoin(projects, eq(shootDays.projectId, projects.id))
@@ -280,7 +282,7 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
         shoot: {
           id: row.project.id,
           ownerId: row.project.ownerId,
-          ownerName: row.ownerName ?? userId,
+          ownerName: row.ownerName || row.ownerEmail || row.project.ownerId,
           title: row.project.title,
           client: row.project.client,
           status: row.project.status,
@@ -542,7 +544,7 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
 
     // Fetch full projects details for these IDs only
     const rows = await db
-      .select({ project: projects, ownerName: users.name })
+      .select({ project: projects, ownerName: users.name, ownerEmail: users.email })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
       .where(inArray(projects.id, projectIds));
@@ -602,7 +604,7 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
     const shaped = rows.map((r) =>
       shapeProject(
         r.project,
-        r.ownerName ?? userId,
+        r.ownerName || r.ownerEmail || r.project.ownerId,
         daysByProject.get(r.project.id) ?? [],
         expensesByProject.get(r.project.id) ?? [],
         membersByProject.get(r.project.id) ?? []
@@ -636,7 +638,7 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
 
     // Check if user is owner
     let [projectData] = await db
-      .select({ project: projects, ownerName: users.name })
+      .select({ project: projects, ownerName: users.name, ownerEmail: users.email })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
       .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
@@ -656,7 +658,7 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
 
       // Fetch project details for crew
       [projectData] = await db
-        .select({ project: projects, ownerName: users.name })
+        .select({ project: projects, ownerName: users.name, ownerEmail: users.email })
         .from(projects)
         .innerJoin(users, eq(projects.ownerId, users.id))
         .where(eq(projects.id, id))
@@ -692,7 +694,7 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(projectData.project, projectData.ownerName ?? userId, days, exps, members) },
+      { project: shapeProject(projectData.project, projectData.ownerName || projectData.ownerEmail || projectData.project.ownerId, days, exps, members) },
       'Project fetched successfully'
     );
   } catch (error) {
