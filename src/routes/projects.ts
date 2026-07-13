@@ -322,6 +322,360 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
   }
 });
 
+// GET /projects/analytics
+router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    // 1. Fetch owned projects
+    const ownedProjects = await db
+      .select()
+      .from(projects)
+      .where(eq(projects.ownerId, userId));
+
+    const ownedProjectIds = ownedProjects.map((p) => p.id);
+
+    // 2. Fetch member projects
+    const memberProjects = await db
+      .select({
+        project: projects,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+      })
+      .from(shootMembers)
+      .innerJoin(projects, eq(shootMembers.projectId, projects.id))
+      .where(eq(shootMembers.userId, userId));
+
+    const memberProjectIds = memberProjects.map((mp) => mp.project.id);
+
+    // 3. Fetch shoot days for owned projects
+    let ownedDays: any[] = [];
+    if (ownedProjectIds.length > 0) {
+      ownedDays = await db
+        .select()
+        .from(shootDays)
+        .where(inArray(shootDays.projectId, ownedProjectIds))
+        .orderBy(asc(shootDays.shootOrder));
+    }
+
+    // 4. Fetch shoot days for member projects
+    let memberDays: any[] = [];
+    if (memberProjectIds.length > 0) {
+      memberDays = await db
+        .select()
+        .from(shootDays)
+        .where(inArray(shootDays.projectId, memberProjectIds))
+        .orderBy(asc(shootDays.shootOrder));
+    }
+
+    // 5. Fetch expenses for owned projects
+    let ownedExpenses: any[] = [];
+    if (ownedProjectIds.length > 0) {
+      ownedExpenses = await db
+        .select()
+        .from(expenses)
+        .where(inArray(expenses.projectId, ownedProjectIds));
+    }
+
+    // 6. Fetch crew payments for owned projects
+    let ownedMembers: any[] = [];
+    if (ownedProjectIds.length > 0) {
+      ownedMembers = await db
+        .select({
+          id: shootMembers.id,
+          projectId: shootMembers.projectId,
+          payment: shootMembers.payment,
+          paymentStatus: shootMembers.paymentStatus,
+          userId: shootMembers.userId,
+          name: users.name,
+          email: users.email,
+        })
+        .from(shootMembers)
+        .leftJoin(users, eq(shootMembers.userId, users.id))
+        .where(inArray(shootMembers.projectId, ownedProjectIds));
+    }
+
+    // 7. Aggregate monthly financials
+    const monthlyData: Record<string, { revenue: number; expenses: number; crewPayouts: number; profit: number; ownedProfit: number; memberEarnings: number }> = {};
+
+    const getMonthlyRecord = (month: string) => {
+      if (!monthlyData[month]) {
+        monthlyData[month] = { revenue: 0, expenses: 0, crewPayouts: 0, profit: 0, ownedProfit: 0, memberEarnings: 0 };
+      }
+      return monthlyData[month];
+    };
+
+    const getProjectMonth = (projId: string, createdAt: Date, days: any[]) => {
+      const projDays = days.filter((d) => d.projectId === projId);
+      if (projDays.length > 0) {
+        const firstDate = projDays[0].date; // YYYY-MM-DD
+        return firstDate.substring(0, 7); // YYYY-MM
+      }
+      return createdAt.toISOString().substring(0, 7); // YYYY-MM
+    };
+
+    // Process owned projects revenue & crew payouts
+    for (const proj of ownedProjects) {
+      const month = getProjectMonth(proj.id, proj.createdAt, ownedDays);
+      const rec = getMonthlyRecord(month);
+      rec.revenue += proj.budget;
+
+      const projMembers = ownedMembers.filter((m) => m.projectId === proj.id);
+      const totalPayout = projMembers.reduce((sum, m) => sum + m.payment, 0);
+      rec.crewPayouts += totalPayout;
+      
+      // ownedProfit: budget - crewPayouts
+      rec.ownedProfit += (proj.budget - totalPayout);
+    }
+
+    // Process expenses
+    for (const exp of ownedExpenses) {
+      const month = exp.date ? exp.date.substring(0, 7) : exp.createdAt.toISOString().substring(0, 7);
+      const rec = getMonthlyRecord(month);
+      rec.expenses += exp.amount;
+      
+      // ownedProfit: subtract expenses
+      rec.ownedProfit -= exp.amount;
+    }
+
+    // Process member projects (payout rate is user's personal revenue)
+    for (const mp of memberProjects) {
+      const month = getProjectMonth(mp.project.id, mp.project.createdAt, memberDays);
+      const rec = getMonthlyRecord(month);
+      rec.revenue += mp.payment;
+      rec.memberEarnings += mp.payment;
+    }
+
+    // Calculate profit
+    for (const month of Object.keys(monthlyData)) {
+      const rec = monthlyData[month];
+      rec.profit = rec.ownedProfit + rec.memberEarnings;
+    }
+
+    // 8. Process crew payouts roster
+    const crewMap: Record<string, { name: string; email: string; initials: string; avatarColor: string; totalPaid: number; totalUnpaid: number }> = {};
+
+    for (const m of ownedMembers) {
+      if (!m.email) continue;
+      const email = m.email.toLowerCase();
+      if (!crewMap[email]) {
+        const name = m.name || m.email.split('@')[0];
+        const getInitials = (n: string) => n.split(' ').map((x) => x[0]).join('').substring(0, 2).toUpperCase();
+
+        let hash = 0;
+        for (let i = 0; i < email.length; i++) {
+          hash = email.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const colors = ['#7C3AED', '#10B981', '#F59E0B', '#EF4444', '#3B82F6', '#EC4899', '#8B5CF6'];
+        const avatarColor = colors[Math.abs(hash) % colors.length];
+
+        crewMap[email] = {
+          name,
+          email,
+          initials: getInitials(name),
+          avatarColor,
+          totalPaid: 0,
+          totalUnpaid: 0,
+        };
+      }
+
+      if (m.paymentStatus === 'paid') {
+        crewMap[email].totalPaid += m.payment;
+      } else {
+        crewMap[email].totalUnpaid += m.payment;
+      }
+    }
+
+    return sendSuccess(res, 200, {
+      timeSeries: Object.entries(monthlyData).map(([month, data]) => ({ month, ...data })),
+      crewPayouts: Object.values(crewMap),
+    }, 'Analytics data compiled successfully');
+  } catch (error) {
+    console.error('Error generating analytics:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to generate analytics' });
+  }
+});
+
+// GET /projects/earnings-history — paginated, searchable earnings list sorted by last shoot day DESC
+router.get('/projects/earnings-history', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+    const limit = 50;
+    const offset = (page - 1) * limit;
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+
+    // 1. Fetch owned projects (with optional search)
+    const allOwnedProjects = await db
+      .select()
+      .from(projects)
+      .where(eq(projects.ownerId, userId));
+
+    // 2. Fetch member projects
+    const allMemberRows = await db
+      .select({
+        project: projects,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+        membershipId: shootMembers.id,
+      })
+      .from(shootMembers)
+      .innerJoin(projects, eq(shootMembers.projectId, projects.id))
+      .where(eq(shootMembers.userId, userId));
+
+    // 3. Fetch last shoot day for all relevant project IDs
+    const allProjectIds = [
+      ...allOwnedProjects.map(p => p.id),
+      ...allMemberRows.map(r => r.project.id),
+    ];
+
+    let lastDayByProject: Record<string, string> = {};
+    if (allProjectIds.length > 0) {
+      const days = await db
+        .select({ projectId: shootDays.projectId, date: shootDays.date })
+        .from(shootDays)
+        .where(inArray(shootDays.projectId, allProjectIds))
+        .orderBy(desc(shootDays.date));
+
+      for (const d of days) {
+        if (!lastDayByProject[d.projectId]) {
+          lastDayByProject[d.projectId] = d.date;
+        }
+      }
+    }
+
+    // 4. Fetch owner details for member projects
+    const ownerIds = [...new Set(allMemberRows.map(r => r.project.ownerId))];
+    let ownerMap: Record<string, { name: string | null; email: string }> = {};
+    if (ownerIds.length > 0) {
+      const ownerRows = await db
+        .select({ id: users.id, name: users.name, email: users.email })
+        .from(users)
+        .where(inArray(users.id, ownerIds));
+      for (const o of ownerRows) {
+        ownerMap[o.id] = { name: o.name, email: o.email };
+      }
+    }
+
+    // 5. Fetch expenses and crew payouts for owned projects
+    let expensesByProject: Record<string, number> = {};
+    let crewByProject: Record<string, number> = {};
+
+    if (allOwnedProjects.length > 0) {
+      const ownedIds = allOwnedProjects.map(p => p.id);
+
+      const expRows = await db
+        .select({ projectId: expenses.projectId, amount: expenses.amount })
+        .from(expenses)
+        .where(inArray(expenses.projectId, ownedIds));
+
+      for (const e of expRows) {
+        expensesByProject[e.projectId] = (expensesByProject[e.projectId] || 0) + e.amount;
+      }
+
+      const memberRows = await db
+        .select({ projectId: shootMembers.projectId, payment: shootMembers.payment })
+        .from(shootMembers)
+        .where(inArray(shootMembers.projectId, ownedIds));
+
+      for (const m of memberRows) {
+        crewByProject[m.projectId] = (crewByProject[m.projectId] || 0) + m.payment;
+      }
+    }
+
+    // 6. Build unified entry list
+    type HistoryEntry = {
+      projectId: string;
+      title: string;
+      client: string;
+      status: string;
+      role: 'owner' | 'crew';
+      lastShootDate: string | null;
+      budget: number;
+      expenses: number;
+      crewPayouts: number;
+      myEarning: number;
+      ownerName: string | null;
+      ownerEmail: string | null;
+    };
+
+    const entries: HistoryEntry[] = [];
+
+    for (const proj of allOwnedProjects) {
+      const totalExp = expensesByProject[proj.id] || 0;
+      const totalCrew = crewByProject[proj.id] || 0;
+      const myEarning = proj.budget - totalExp - totalCrew;
+
+      entries.push({
+        projectId: proj.id,
+        title: proj.title,
+        client: proj.client,
+        status: proj.status,
+        role: 'owner',
+        lastShootDate: lastDayByProject[proj.id] || null,
+        budget: proj.budget,
+        expenses: totalExp,
+        crewPayouts: totalCrew,
+        myEarning,
+        ownerName: null,
+        ownerEmail: null,
+      });
+    }
+
+    for (const row of allMemberRows) {
+      const owner = ownerMap[row.project.ownerId];
+      entries.push({
+        projectId: row.project.id,
+        title: row.project.title,
+        client: row.project.client,
+        status: row.project.status,
+        role: 'crew',
+        lastShootDate: lastDayByProject[row.project.id] || null,
+        budget: row.project.budget,
+        expenses: 0,
+        crewPayouts: 0,
+        myEarning: row.payment,
+        ownerName: owner?.name ?? null,
+        ownerEmail: owner?.email ?? null,
+      });
+    }
+
+    // 7. Sort descending by lastShootDate, then createdAt as fallback
+    entries.sort((a, b) => {
+      const da = a.lastShootDate ?? '';
+      const db_ = b.lastShootDate ?? '';
+      if (da === db_) return 0;
+      if (!da) return 1;
+      if (!db_) return -1;
+      return db_.localeCompare(da);
+    });
+
+    // 8. Apply search filter
+    const filtered = q
+      ? entries.filter(e =>
+          e.title.toLowerCase().includes(q) ||
+          e.client.toLowerCase().includes(q)
+        )
+      : entries;
+
+    // 9. Paginate
+    const total = filtered.length;
+    const pages = Math.ceil(total / limit) || 1;
+    const paginated = filtered.slice(offset, offset + limit);
+
+    return sendSuccess(res, 200, {
+      items: paginated,
+      pagination: { total, page, limit, pages },
+    }, 'Earnings history fetched successfully');
+  } catch (error) {
+    console.error('Error fetching earnings history:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch earnings history' });
+  }
+});
+
 // POST /projects — create project + shoot days atomically
 router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
   try {
