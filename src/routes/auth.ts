@@ -290,6 +290,72 @@ router.get('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
   }
 });
 
+// PUT /me — update profile details
+router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return sendError(res, 401, {
+        code: 'UNAUTHORIZED',
+        message: 'User identity could not be verified',
+      });
+    }
+
+    const { name, businessName, password } = req.body;
+
+    // Validation
+    const fields: Record<string, string> = {};
+    if (name !== undefined && (!name || typeof name !== 'string' || !name.trim())) {
+      fields.name = 'Name cannot be empty';
+    }
+    if (password !== undefined && password !== null && (typeof password !== 'string' || password.length < 8)) {
+      fields.password = 'Password must be at least 8 characters';
+    }
+
+    if (Object.keys(fields).length > 0) {
+      return sendError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Validation failed',
+        fields,
+      });
+    }
+
+    // Prepare update payload
+    const updatePayload: any = {
+      updatedAt: new Date(),
+    };
+    if (name !== undefined) updatePayload.name = name.trim();
+    if (businessName !== undefined) updatePayload.businessName = businessName?.trim() || null;
+    if (password !== undefined && password !== null) {
+      updatePayload.passwordHash = await hashPassword(password);
+    }
+
+    const [updatedUser] = await db
+      .update(users)
+      .set(updatePayload)
+      .where(eq(users.id, userId))
+      .returning();
+
+    if (!updatedUser) {
+      return sendError(res, 404, {
+        code: 'NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+
+    const { passwordHash: _, ...userWithoutPassword } = updatedUser;
+    return sendSuccess(res, 200, {
+      user: userWithoutPassword,
+    }, 'Profile updated successfully');
+  } catch (error) {
+    console.error('Update profile error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred updating profile',
+    });
+  }
+});
+
 // POST /auth/forgot-password
 router.post('/auth/forgot-password', async (req, res) => {
   console.log(`[POST] /auth/forgot-password request received for email: ${req.body?.email}`);
