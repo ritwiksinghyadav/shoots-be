@@ -52,6 +52,7 @@ function getInitials(nameOrEmail: string) {
 function shapeProject(
   p: typeof projects.$inferSelect,
   ownerName: string,
+  ownerEmail: string,
   days: (typeof shootDays.$inferSelect)[],
   exps: (typeof expenses.$inferSelect)[] = [],
   team: {
@@ -68,6 +69,7 @@ function shapeProject(
     id: p.id,
     ownerId: p.ownerId,
     ownerName,
+    ownerEmail,
     title: p.title,
     client: p.client,
     status: p.status,
@@ -378,13 +380,13 @@ router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
 
     const insertedDays = await db.insert(shootDays).values(dayValues).returning();
 
-    // ── Fetch owner name ──────────────────────────────────────────────────
-    const [owner] = await db.select({ name: users.name }).from(users).where(eq(users.id, userId)).limit(1);
+    // ── Fetch owner name & email ──────────────────────────────────────────
+    const [owner] = await db.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, userId)).limit(1);
 
     return sendSuccess(
       res,
       201,
-      { project: shapeProject(newProject, owner?.name ?? userId, insertedDays, [], []) },
+      { project: shapeProject(newProject, owner?.name ?? userId, owner?.email ?? '', insertedDays, [], []) },
       'Project created successfully'
     );
   } catch (error) {
@@ -605,6 +607,7 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       shapeProject(
         r.project,
         r.ownerName || r.ownerEmail || r.project.ownerId,
+        r.ownerEmail || '',
         daysByProject.get(r.project.id) ?? [],
         expensesByProject.get(r.project.id) ?? [],
         membersByProject.get(r.project.id) ?? []
@@ -694,7 +697,7 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(projectData.project, projectData.ownerName || projectData.ownerEmail || projectData.project.ownerId, days, exps, members) },
+      { project: shapeProject(projectData.project, projectData.ownerName || projectData.ownerEmail || projectData.project.ownerId, projectData.ownerEmail ?? '', days, exps, members) },
       'Project fetched successfully'
     );
   } catch (error) {
@@ -755,7 +758,7 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .orderBy(asc(expenses.createdAt));
 
     const [owner] = await db
-      .select({ name: users.name })
+      .select({ name: users.name, email: users.email })
       .from(users)
       .where(eq(users.id, userId))
       .limit(1);
@@ -777,7 +780,7 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(updatedProject, owner?.name ?? userId, days, exps, members) },
+      { project: shapeProject(updatedProject, owner?.name ?? userId, owner?.email ?? '', days, exps, members) },
       'Project updated successfully'
     );
   } catch (error) {

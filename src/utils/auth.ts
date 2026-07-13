@@ -25,7 +25,7 @@ export function generateAccessToken(payload: JWTPayload): string {
 export function generateRefreshToken(payload: JWTPayload): string {
   const secret = process.env.JWT_REFRESH_SECRET;
   if (!secret) throw new Error('JWT_REFRESH_SECRET is not configured');
-  return jwt.sign(payload, secret, { expiresIn: '30d' });
+  return jwt.sign(payload, secret, { expiresIn: '60d' });
 }
 
 export function verifyAccessToken(token: string): JWTPayload {
