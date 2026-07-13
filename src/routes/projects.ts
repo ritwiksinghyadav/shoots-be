@@ -127,9 +127,13 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
       .from(shootDays)
       .innerJoin(projects, eq(shootDays.projectId, projects.id))
       .innerJoin(users, eq(projects.ownerId, users.id))
+      .leftJoin(shootMembers, and(eq(projects.id, shootMembers.projectId), eq(shootMembers.userId, userId)))
       .where(
         and(
-          eq(projects.ownerId, userId),
+          or(
+            eq(projects.ownerId, userId),
+            eq(shootMembers.userId, userId)
+          ),
           gte(shootDays.date, todayStr),
           lte(shootDays.date, oneMonthLaterStr),
           ne(projects.status, 'done'),
@@ -138,8 +142,34 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
       )
       .orderBy(asc(shootDays.date), asc(shootDays.time));
 
+    const projectIds = Array.from(new Set(rows.map((r) => r.project.id)));
+
+    // Fetch all shoot members for those projects in one query
+    const allMembers = projectIds.length > 0 ? await db
+      .select({
+        id: shootMembers.id,
+        projectId: shootMembers.projectId,
+        userId: shootMembers.userId,
+        name: users.name,
+        email: users.email,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+        invited: shootMembers.invited,
+      })
+      .from(shootMembers)
+      .leftJoin(users, eq(shootMembers.userId, users.id))
+      .where(inArray(shootMembers.projectId, projectIds)) : [];
+
+    // Group members by project
+    const membersByProject = new Map<string, typeof allMembers>();
+    for (const m of allMembers) {
+      if (!membersByProject.has(m.projectId)) membersByProject.set(m.projectId, []);
+      membersByProject.get(m.projectId)!.push(m);
+    }
+
     const result = rows.map((row) => {
       const shapedDay = shapeShootDay(row.shootDay);
+      const projectMembers = membersByProject.get(row.project.id) ?? [];
       return {
         shoot: {
           id: row.project.id,
@@ -153,7 +183,21 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
           notes: row.project.notes ?? '',
           category: 'editorial',
           coverColor: '#7C3AED',
-          team: [],
+          team: projectMembers.map((t) => {
+            const email = t.email ?? '';
+            const name = t.name || null;
+            return {
+              id: t.id,
+              userId: t.userId,
+              name,
+              email,
+              initials: getInitials(name || email),
+              payment: t.payment,
+              paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+              invited: t.invited,
+              avatarColor: getAvatarColor(email),
+            };
+          }),
           expenses: [],
           shootDays: [shapedDay],
         },
@@ -192,16 +236,46 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
       .from(shootDays)
       .innerJoin(projects, eq(shootDays.projectId, projects.id))
       .innerJoin(users, eq(projects.ownerId, users.id))
+      .leftJoin(shootMembers, and(eq(projects.id, shootMembers.projectId), eq(shootMembers.userId, userId)))
       .where(
         and(
-          eq(projects.ownerId, userId),
+          or(
+            eq(projects.ownerId, userId),
+            eq(shootMembers.userId, userId)
+          ),
           like(shootDays.date, `${prefix}%`)
         )
       )
       .orderBy(asc(shootDays.date), asc(shootDays.time));
 
+    const projectIds = Array.from(new Set(rows.map((r) => r.project.id)));
+
+    // Fetch all shoot members for those projects in one query
+    const allMembers = projectIds.length > 0 ? await db
+      .select({
+        id: shootMembers.id,
+        projectId: shootMembers.projectId,
+        userId: shootMembers.userId,
+        name: users.name,
+        email: users.email,
+        payment: shootMembers.payment,
+        paymentStatus: shootMembers.paymentStatus,
+        invited: shootMembers.invited,
+      })
+      .from(shootMembers)
+      .leftJoin(users, eq(shootMembers.userId, users.id))
+      .where(inArray(shootMembers.projectId, projectIds)) : [];
+
+    // Group members by project
+    const membersByProject = new Map<string, typeof allMembers>();
+    for (const m of allMembers) {
+      if (!membersByProject.has(m.projectId)) membersByProject.set(m.projectId, []);
+      membersByProject.get(m.projectId)!.push(m);
+    }
+
     const result = rows.map((row) => {
       const shapedDay = shapeShootDay(row.shootDay);
+      const projectMembers = membersByProject.get(row.project.id) ?? [];
       return {
         shoot: {
           id: row.project.id,
@@ -215,7 +289,21 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
           notes: row.project.notes ?? '',
           category: 'editorial',
           coverColor: '#7C3AED',
-          team: [],
+          team: projectMembers.map((t) => {
+            const email = t.email ?? '';
+            const name = t.name || null;
+            return {
+              id: t.id,
+              userId: t.userId,
+              name,
+              email,
+              initials: getInitials(name || email),
+              payment: t.payment,
+              paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+              invited: t.invited,
+              avatarColor: getAvatarColor(email),
+            };
+          }),
           expenses: [],
           shootDays: [shapedDay],
         },

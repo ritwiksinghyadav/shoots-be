@@ -204,3 +204,137 @@ export async function sendInvitationEmail(
     return false;
   }
 }
+
+export async function sendPasswordResetEmail(
+  toEmail: string,
+  resetLink: string
+): Promise<boolean> {
+  if (!BREVO_API_KEY) {
+    console.warn('sendPasswordResetEmail: BREVO_API_KEY is not defined. Skipping email sending.');
+    return false;
+  }
+
+  const client = new Brevo.BrevoClient({ apiKey: BREVO_API_KEY });
+
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Reset your password</title>
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          background-color: #FAFAF8;
+          color: #1C1917;
+          padding: 40px 20px;
+          margin: 0;
+        }
+        .container {
+          max-width: 500px;
+          margin: 0 auto;
+          background-color: #FFFFFF;
+          border: 1px solid #E7E5E4;
+          border-radius: 20px;
+          padding: 36px;
+          box-shadow: 0 4px 12px rgba(28, 25, 23, 0.03);
+        }
+        .logo {
+          font-weight: 800;
+          font-size: 16px;
+          letter-spacing: -0.025em;
+          margin-bottom: 28px;
+          color: #1C1917;
+        }
+        h1 {
+          font-size: 22px;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          margin-top: 0;
+          margin-bottom: 16px;
+          color: #1C1917;
+        }
+        p {
+          font-size: 14px;
+          line-height: 1.6;
+          color: #44403C;
+          margin-top: 0;
+          margin-bottom: 24px;
+        }
+        .btn-container {
+          text-align: center;
+          margin-top: 28px;
+          margin-bottom: 12px;
+        }
+        .btn {
+          display: inline-block;
+          background-color: #1C1917;
+          color: #FFFFFF !important;
+          text-decoration: none;
+          padding: 12px 28px;
+          border-radius: 9999px;
+          font-size: 13px;
+          font-weight: 600;
+          text-align: center;
+          transition: background-color 150ms ease;
+        }
+        .footer-note {
+          font-size: 12px;
+          color: #A8A29E;
+          text-align: center;
+          margin-top: 32px;
+          line-height: 1.5;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="logo">📷 SHOOTS</div>
+        <h1>Reset your password</h1>
+        <p>Hi there,</p>
+        <p>We received a request to reset your password for your SHOOTS account. Click the button below to choose a new password. This link is valid for 1 hour.</p>
+        
+        <div class="btn-container">
+          <a href="${resetLink}" class="btn">Reset Password</a>
+        </div>
+        
+        <p style="font-size: 12px; color: #78716C; margin-top: 20px; word-break: break-all;">
+          If the button doesn't work, copy and paste this URL into your browser: <br/>
+          <a href="${resetLink}" style="color: #1C1917; text-decoration: underline;">${resetLink}</a>
+        </p>
+
+        <div class="footer-note">
+          If you did not request this, you can safely ignore this email. Your password will remain unchanged.
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const emailData: any = {
+    subject: 'Reset your password on SHOOTS',
+    htmlContent,
+    to: [{ email: toEmail }],
+    sender: {
+      name: SENDER_NAME,
+      email: SENDER_EMAIL
+    }
+  };
+
+  try {
+    const res = await client.transactionalEmails.sendTransacEmail(emailData);
+    console.log(`Successfully sent password reset email to ${toEmail} via Brevo SDK. Response:`, res);
+    return true;
+  } catch (error) {
+    if (error instanceof Brevo.Brevo.UnauthorizedError) {
+      console.error('Brevo API Error: Invalid API key or IP address restriction (UnauthorizedError)');
+    } else if (error instanceof Brevo.Brevo.TooManyRequestsError) {
+      console.error('Brevo API Error: Rate limited (TooManyRequestsError)');
+    } else if (error instanceof Brevo.BrevoError) {
+      console.error(`Brevo API Error ${error.statusCode}:`, error.message);
+    } else {
+      console.error(`Error sending password reset email to ${toEmail} via Brevo SDK:`, error);
+    }
+    return false;
+  }
+}

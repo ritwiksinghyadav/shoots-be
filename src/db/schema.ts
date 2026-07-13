@@ -9,6 +9,8 @@ export const users = pgTable('users', {
   invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
   firstLogin: smallint('first_login').default(1).notNull(),
   isVerified: boolean('is_verified').default(false).notNull(),
+  resetToken: text('reset_token'),
+  resetTokenExpiry: timestamp('reset_token_expiry', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });

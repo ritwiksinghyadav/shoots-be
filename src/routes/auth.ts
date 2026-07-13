@@ -1,5 +1,6 @@
 import { Router, Response } from 'express';
-import { eq } from 'drizzle-orm';
+import { eq, and, gt } from 'drizzle-orm';
+import crypto from 'crypto';
 import { db } from '../db/index.js';
 import { users } from '../db/schema.js';
 import {
@@ -11,6 +12,7 @@ import {
 } from '../utils/auth.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
+import { sendPasswordResetEmail } from '../utils/email.js';
 
 const router = Router();
 
@@ -284,6 +286,140 @@ router.get('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     return sendError(res, 500, {
       code: 'INTERNAL_SERVER_ERROR',
       message: 'An unexpected error occurred fetching profile',
+    });
+  }
+});
+
+// POST /auth/forgot-password
+router.post('/auth/forgot-password', async (req, res) => {
+  console.log(`[POST] /auth/forgot-password request received for email: ${req.body?.email}`);
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      return sendError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Email is required',
+        fields: { email: 'Email is required' },
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Check if user is present
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, cleanEmail))
+      .limit(1);
+
+    if (!user) {
+      return sendError(res, 404, {
+        code: 'NOT_FOUND',
+        message: 'No account found with this email address.',
+        fields: { email: 'No account found with this email address.' },
+      });
+    }
+
+    // Create one-time use token
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    // Patch to user
+    await db
+      .update(users)
+      .set({
+        resetToken: token,
+        resetTokenExpiry: expiry,
+      })
+      .where(eq(users.id, user.id));
+
+    // Send email
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3005';
+    const resetLink = `${frontendUrl}/reset-password?token=${token}`;
+    
+    const emailSent = await sendPasswordResetEmail(cleanEmail, resetLink);
+    if (!emailSent) {
+      return sendError(res, 500, {
+        code: 'EMAIL_SEND_FAILED',
+        message: 'Failed to send password reset email. Please try again later.',
+      });
+    }
+
+    return sendSuccess(res, 200, {}, 'Password reset email sent successfully.');
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred processing your request',
+    });
+  }
+});
+
+// POST /auth/reset-password
+router.post('/auth/reset-password', async (req, res) => {
+  console.log('[POST] /auth/reset-password request received');
+  try {
+    const { token, password, confirmPassword } = req.body;
+
+    const fields: Record<string, string> = {};
+    if (!token || typeof token !== 'string') {
+      fields.token = 'Token is required';
+    }
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      fields.password = 'Password must be at least 8 characters';
+    }
+    if (password !== confirmPassword) {
+      fields.confirmPassword = 'Passwords do not match';
+    }
+
+    if (Object.keys(fields).length > 0) {
+      return sendError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Validation failed',
+        fields,
+      });
+    }
+
+    // Find the user with active token and expiry > current time
+    const now = new Date();
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(
+        and(
+          eq(users.resetToken, token),
+          gt(users.resetTokenExpiry, now)
+        )
+      )
+      .limit(1);
+
+    if (!user) {
+      return sendError(res, 400, {
+        code: 'INVALID_TOKEN',
+        message: 'Invalid or expired password reset link.',
+      });
+    }
+
+    // Hash the password
+    const newPasswordHash = await hashPassword(password);
+
+    // Update user password and clear token
+    await db
+      .update(users)
+      .set({
+        passwordHash: newPasswordHash,
+        resetToken: null,
+        resetTokenExpiry: null,
+      })
+      .where(eq(users.id, user.id));
+
+    return sendSuccess(res, 200, {}, 'Password reset successfully.');
+  } catch (error) {
+    console.error('Reset password error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred while resetting your password.',
     });
   }
 });
