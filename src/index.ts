@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
+import helmet from 'helmet';
 import authRouter from './routes/auth.js';
 import projectsRouter from './routes/projects.js';
 import { sendSuccess, sendError } from './utils/response.js';
@@ -12,6 +13,7 @@ import { requestLogger } from './middleware/logger.js';
 dotenv.config();
 
 const app = express();
+app.use(helmet());
 const PORT = process.env.PORT || 5000;
 
 // CORS setup supporting dynamic local development ports
