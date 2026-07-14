@@ -301,7 +301,7 @@ router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
-    const { name, businessName, password } = req.body;
+    const { name, businessName, password, preferredCurrency } = req.body;
 
     // Validation
     const fields: Record<string, string> = {};
@@ -310,6 +310,10 @@ router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     }
     if (password !== undefined && password !== null && (typeof password !== 'string' || password.length < 8)) {
       fields.password = 'Password must be at least 8 characters';
+    }
+    const VALID_CURRENCIES = ['USD', 'EUR', 'GBP', 'INR', 'AED', 'SGD', 'JPY', 'AUD', 'CAD', 'CHF', 'HKD', 'MYR', 'THB', 'NZD'];
+    if (preferredCurrency !== undefined && !VALID_CURRENCIES.includes(preferredCurrency)) {
+      fields.preferredCurrency = 'Invalid currency code';
     }
 
     if (Object.keys(fields).length > 0) {
@@ -326,6 +330,7 @@ router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     };
     if (name !== undefined) updatePayload.name = name.trim();
     if (businessName !== undefined) updatePayload.businessName = businessName?.trim() || null;
+    if (preferredCurrency !== undefined) updatePayload.preferredCurrency = preferredCurrency;
     if (password !== undefined && password !== null) {
       updatePayload.passwordHash = await hashPassword(password);
     }
@@ -355,6 +360,7 @@ router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     });
   }
 });
+
 
 // POST /auth/forgot-password
 router.post('/auth/forgot-password', async (req, res) => {

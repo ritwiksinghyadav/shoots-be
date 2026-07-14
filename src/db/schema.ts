@@ -6,6 +6,7 @@ export const users = pgTable('users', {
   email: text('email').notNull().unique(),
   passwordHash: text('password_hash'),
   businessName: text('business_name'),
+  preferredCurrency: text('preferred_currency').notNull().default('USD'),
   invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
   firstLogin: smallint('first_login').default(1).notNull(),
   isVerified: boolean('is_verified').default(false).notNull(),
@@ -14,6 +15,7 @@ export const users = pgTable('users', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
 
 export const projects = pgTable('projects', {
   id: uuid('id').defaultRandom().primaryKey(),
