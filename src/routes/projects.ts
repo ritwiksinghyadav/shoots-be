@@ -1526,11 +1526,14 @@ router.delete('/projects/:projectId/members/:memberId', async (req: Authenticate
   }
 });
 
-// GET /team-members — fetch all team members for Quick Add Crew and homepage counts
+// GET /team-members — fetch all team members for Quick Add Crew, homepage counts, and Circle view with availability
 router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const datesQuery = req.query.dates as string; // comma-separated dates, e.g. "2026-07-16,2026-07-20"
+    const targetDates = datesQuery ? datesQuery.split(',').map((d) => d.trim()).filter(Boolean) : [];
 
     const rows = await db
       .select({
@@ -1542,18 +1545,63 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
       .innerJoin(users, eq(teamMembers.memberId, users.id))
       .where(eq(teamMembers.userId, userId));
 
-    const result = rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      email: r.email,
-      initials: getInitials(r.name || r.email),
-      avatarColor: getAvatarColor(r.email),
-    }));
+    const memberIds = rows.map((r) => r.id);
+    let bookings: Array<{ userId: string | null; date: string; projectTitle: string }> = [];
+
+    if (memberIds.length > 0 && targetDates.length > 0) {
+      bookings = await db
+        .select({
+          userId: shootMembers.userId,
+          date: shootDays.date,
+          projectTitle: projects.title,
+        })
+        .from(shootMembers)
+        .innerJoin(projects, eq(shootMembers.projectId, projects.id))
+        .innerJoin(shootDays, eq(shootDays.projectId, projects.id))
+        .where(
+          and(
+            inArray(shootMembers.userId, memberIds),
+            inArray(shootDays.date, targetDates)
+          )
+        );
+    }
+
+    const result = rows.map((r) => {
+      const userBookings = bookings.filter((b) => b.userId === r.id);
+      const isAvailable = userBookings.length === 0;
+      return {
+        id: r.id,
+        name: r.name,
+        email: r.email,
+        initials: getInitials(r.name || r.email),
+        avatarColor: getAvatarColor(r.email),
+        isAvailable: datesQuery ? isAvailable : undefined,
+        busyOn: datesQuery && !isAvailable ? userBookings.map((b) => ({ date: b.date, projectTitle: b.projectTitle })) : undefined,
+      };
+    });
 
     return sendSuccess(res, 200, { teamMembers: result }, 'Team members fetched successfully');
   } catch (error) {
     console.error('Error fetching team members:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch team members' });
+  }
+});
+
+// DELETE /team-members/:memberId — remove a team member from the user's circle
+router.delete('/team-members/:memberId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const memberId = String(req.params.memberId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    await db
+      .delete(teamMembers)
+      .where(and(eq(teamMembers.userId, userId), eq(teamMembers.memberId, memberId)));
+
+    return sendSuccess(res, 200, {}, 'Team member removed from circle successfully');
+  } catch (error) {
+    console.error('Error removing team member from circle:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to remove team member from circle' });
   }
 });
 
