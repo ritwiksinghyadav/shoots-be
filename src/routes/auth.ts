@@ -253,8 +253,8 @@ router.post('/auth/logout', (req, res) => {
   return sendSuccess(res, 200, {}, 'Logged out successfully');
 });
 
-// GET /me
-router.get('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+// GET /auth/me
+router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -290,8 +290,8 @@ router.get('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
   }
 });
 
-// PUT /me — update profile details
-router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+// PUT /auth/me — update profile details
+router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -325,7 +325,8 @@ router.put('/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     }
 
     // Prepare update payload
-    const updatePayload: any = {
+    type UserUpdateData = Partial<Pick<typeof users.$inferInsert, 'name' | 'businessName' | 'preferredCurrency' | 'passwordHash'>> & { updatedAt: Date };
+    const updatePayload: UserUpdateData = {
       updatedAt: new Date(),
     };
     if (name !== undefined) updatePayload.name = name.trim();

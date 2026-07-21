@@ -51,6 +51,35 @@ app.get('/health', (req, res) => {
   sendSuccess(res, 200, { status: 'ok', timestamp: new Date() }, 'Health check success');
 });
 
+// Global error handler — prevents unhandled errors from leaking stack traces
+// IMPORTANT: This must be defined AFTER all routes and BEFORE app.listen
+app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('[Global Error Handler]', err);
+
+  // Structured error from sendError-style middleware
+  if ('statusCode' in err && typeof err.statusCode === 'number') {
+    return res.status(err.statusCode as number).json({
+      success: false,
+      error: {
+        code: (err as any).code || 'INTERNAL_SERVER_ERROR',
+        message: err.message,
+      },
+      statusCode: err.statusCode,
+    });
+  }
+
+  const isDev = process.env.NODE_ENV !== 'production';
+  return res.status(500).json({
+    success: false,
+    error: {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: isDev ? err.message : 'An unexpected error occurred',
+      ...(isDev ? { stack: err.stack } : {}),
+    },
+    statusCode: 500,
+  });
+});
+
 // Standardized 404 Route handler
 app.use((req, res) => {
   sendError(res, 404, {

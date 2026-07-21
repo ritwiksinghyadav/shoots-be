@@ -1,5 +1,5 @@
 import * as dotenv from 'dotenv';
-import * as Brevo from '@getbrevo/brevo';
+import { Brevo, BrevoClient, BrevoError } from '@getbrevo/brevo';
 
 dotenv.config();
 
@@ -42,7 +42,7 @@ export async function sendInvitationEmail(
     ? sortedDates.map(d => formatDisplayDate(d)).join(', ')
     : 'TBD';
 
-  const client = new Brevo.BrevoClient({ apiKey: BREVO_API_KEY });
+  const client = new BrevoClient({ apiKey: BREVO_API_KEY });
 
   const htmlContent = `
     <!DOCTYPE html>
@@ -177,7 +177,7 @@ export async function sendInvitationEmail(
     </html>
   `;
 
-  const emailData: any = {
+  const emailData: Brevo.SendTransacEmailRequest = {
     subject: `You've been added to "${projectName}" on SHOOTS`,
     htmlContent,
     to: [{ email: toEmail }],
@@ -192,11 +192,11 @@ export async function sendInvitationEmail(
     console.log(`Successfully sent invitation email to ${toEmail} via Brevo SDK. Response:`, res);
     return true;
   } catch (error) {
-    if (error instanceof Brevo.Brevo.UnauthorizedError) {
+    if (error instanceof Brevo.UnauthorizedError) {
       console.error('Brevo API Error: Invalid API key or IP address restriction (UnauthorizedError)');
-    } else if (error instanceof Brevo.Brevo.TooManyRequestsError) {
+    } else if (error instanceof Brevo.TooManyRequestsError) {
       console.error('Brevo API Error: Rate limited (TooManyRequestsError)');
-    } else if (error instanceof Brevo.BrevoError) {
+    } else if (error instanceof BrevoError) {
       console.error(`Brevo API Error ${error.statusCode}:`, error.message);
     } else {
       console.error(`Error sending invitation email to ${toEmail} via Brevo SDK:`, error);
@@ -214,7 +214,7 @@ export async function sendPasswordResetEmail(
     return false;
   }
 
-  const client = new Brevo.BrevoClient({ apiKey: BREVO_API_KEY });
+  const client = new BrevoClient({ apiKey: BREVO_API_KEY });
 
   const htmlContent = `
     <!DOCTYPE html>
@@ -311,7 +311,7 @@ export async function sendPasswordResetEmail(
     </html>
   `;
 
-  const emailData: any = {
+  const emailData: Brevo.SendTransacEmailRequest = {
     subject: 'Reset your password on SHOOTS',
     htmlContent,
     to: [{ email: toEmail }],
@@ -326,11 +326,11 @@ export async function sendPasswordResetEmail(
     console.log(`Successfully sent password reset email to ${toEmail} via Brevo SDK. Response:`, res);
     return true;
   } catch (error) {
-    if (error instanceof Brevo.Brevo.UnauthorizedError) {
+    if (error instanceof Brevo.UnauthorizedError) {
       console.error('Brevo API Error: Invalid API key or IP address restriction (UnauthorizedError)');
-    } else if (error instanceof Brevo.Brevo.TooManyRequestsError) {
+    } else if (error instanceof Brevo.TooManyRequestsError) {
       console.error('Brevo API Error: Rate limited (TooManyRequestsError)');
-    } else if (error instanceof Brevo.BrevoError) {
+    } else if (error instanceof BrevoError) {
       console.error(`Brevo API Error ${error.statusCode}:`, error.message);
     } else {
       console.error(`Error sending password reset email to ${toEmail} via Brevo SDK:`, error);

@@ -78,21 +78,7 @@ function shapeProject(
     notes: p.notes ?? '',
     category: 'editorial' as const,
     coverColor: '#7C3AED',
-    team: team.map((t) => {
-      const email = t.email ?? '';
-      const name = t.name || null;
-      return {
-        id: t.id,
-        userId: t.userId,
-        name,
-        email,
-        initials: getInitials(name || email),
-        payment: t.payment,
-        paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
-        invited: t.invited,
-        avatarColor: getAvatarColor(email),
-      };
-    }),
+    team: team.map(shapeTeamMember),
     expenses: exps.map((e) => ({
       id: e.id,
       label: e.label,
@@ -101,6 +87,91 @@ function shapeProject(
       date: e.date ?? undefined,
     })),
     shootDays: days.map(shapeShootDay),
+  };
+}
+
+/** Strip confidential financial and expense details from a project for a crew member */
+function stripProjectForMember(project: ReturnType<typeof shapeProject>, userId: string) {
+  return {
+    ...project,
+    budget: 0,
+    expenses: [],
+    team: project.team.map((member) => {
+      // Keep own payment details, mask other crew members' financial details
+      if (member.userId === userId) {
+        return member;
+      }
+      return {
+        ...member,
+        payment: 0,
+        paymentStatus: 'unpaid' as const,
+      };
+    }),
+  };
+}
+
+// ─── Shared helpers ─────────────────────────────────────────────────────────
+
+/** Verify the user owns the project and return it, or send a 403/404. */
+async function requireProjectOwner(
+  projectId: string,
+  userId: string,
+  res: Response
+): Promise<typeof projects.$inferSelect | undefined> {
+  // 1. Fetch project by ID (without ownerId filtering first to check existence)
+  const [project] = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.id, projectId))
+    .limit(1);
+
+  if (!project) {
+    sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    return undefined;
+  }
+
+  // 2. Check if user is the owner
+  if (project.ownerId === userId) {
+    return project;
+  }
+
+  // 3. Check if user is a member of the project
+  const [isMember] = await db
+    .select()
+    .from(shootMembers)
+    .where(and(eq(shootMembers.projectId, projectId), eq(shootMembers.userId, userId)))
+    .limit(1);
+
+  if (isMember) {
+    sendError(res, 403, { code: 'FORBIDDEN', message: 'You do not have permission to mutate this project' });
+  } else {
+    sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+  }
+  return undefined;
+}
+
+/** Shape a shoot member row (with optional joined user fields) into the API shape. */
+function shapeTeamMember(t: {
+  id: string;
+  userId: string | null;
+  name: string | null;
+  email: string | null;
+  payment: number;
+  paymentStatus: string;
+  invited: boolean;
+}) {
+  const email = t.email ?? '';
+  const name = t.name || null;
+  return {
+    id: t.id,
+    userId: t.userId,
+    name,
+    email,
+    initials: getInitials(name || email),
+    payment: t.payment,
+    paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+    invited: t.invited,
+    avatarColor: getAvatarColor(email),
   };
 }
 
@@ -186,21 +257,7 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
           notes: row.project.notes ?? '',
           category: 'editorial',
           coverColor: '#7C3AED',
-          team: projectMembers.map((t) => {
-            const email = t.email ?? '';
-            const name = t.name || null;
-            return {
-              id: t.id,
-              userId: t.userId,
-              name,
-              email,
-              initials: getInitials(name || email),
-              payment: t.payment,
-              paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
-              invited: t.invited,
-              avatarColor: getAvatarColor(email),
-            };
-          }),
+          team: projectMembers.map(shapeTeamMember),
           expenses: [],
           shootDays: [shapedDay],
         },
@@ -293,21 +350,7 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
           notes: row.project.notes ?? '',
           category: 'editorial',
           coverColor: '#7C3AED',
-          team: projectMembers.map((t) => {
-            const email = t.email ?? '';
-            const name = t.name || null;
-            return {
-              id: t.id,
-              userId: t.userId,
-              name,
-              email,
-              initials: getInitials(name || email),
-              payment: t.payment,
-              paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
-              invited: t.invited,
-              avatarColor: getAvatarColor(email),
-            };
-          }),
+          team: projectMembers.map(shapeTeamMember),
           expenses: [],
           shootDays: [shapedDay],
         },
@@ -328,75 +371,72 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // 1. Fetch owned projects
-    const ownedProjects = await db
-      .select()
-      .from(projects)
-      .where(eq(projects.ownerId, userId));
+    // 1. Fetch owned projects summary: budget, project month, and crew payouts
+    const ownedProjectsQuery = await db.execute(sql`
+      SELECT 
+        p.id,
+        p.budget,
+        COALESCE(
+          (SELECT LEFT(MIN(sd.date), 7) FROM shoot_days sd WHERE sd.project_id = p.id),
+          TO_CHAR(p.created_at, 'YYYY-MM')
+        ) AS project_month,
+        COALESCE(
+          (SELECT SUM(sm.payment) FROM shoot_members sm WHERE sm.project_id = p.id),
+          0
+        )::integer AS crew_payouts
+      FROM projects p
+      WHERE p.owner_id = ${userId}::uuid
+    `);
 
-    const ownedProjectIds = ownedProjects.map((p) => p.id);
+    // 2. Fetch expenses grouped by month for owned projects
+    const expensesQuery = await db.execute(sql`
+      SELECT 
+        COALESCE(
+          LEFT(e.date, 7),
+          TO_CHAR(e.created_at, 'YYYY-MM')
+        ) AS expense_month,
+        SUM(e.amount)::integer AS total_amount
+      FROM expenses e
+      JOIN projects p ON e.project_id = p.id
+      WHERE p.owner_id = ${userId}::uuid
+      GROUP BY expense_month
+    `);
 
-    // 2. Fetch member projects
-    const memberProjects = await db
-      .select({
-        project: projects,
-        payment: shootMembers.payment,
-        paymentStatus: shootMembers.paymentStatus,
-      })
-      .from(shootMembers)
-      .innerJoin(projects, eq(shootMembers.projectId, projects.id))
-      .where(eq(shootMembers.userId, userId));
+    // 3. Fetch member projects: payment earnings grouped by project month
+    const memberProjectsQuery = await db.execute(sql`
+      SELECT 
+        COALESCE(
+          (SELECT LEFT(MIN(sd.date), 7) FROM shoot_days sd WHERE sd.project_id = p.id),
+          TO_CHAR(p.created_at, 'YYYY-MM')
+        ) AS project_month,
+        SUM(sm.payment)::integer AS total_payment
+      FROM shoot_members sm
+      JOIN projects p ON sm.project_id = p.id
+      WHERE sm.user_id = ${userId}::uuid
+      GROUP BY project_month
+    `);
 
-    const memberProjectIds = memberProjects.map((mp) => mp.project.id);
+    // 4. Fetch crew payouts: aggregated by crew member email
+    const crewPayoutsQuery = await db.execute(sql`
+      SELECT 
+        LOWER(u.email) AS email,
+        MAX(u.name) AS name,
+        SUM(CASE WHEN sm.payment_status = 'paid' THEN sm.payment ELSE 0 END)::integer AS total_paid,
+        SUM(CASE WHEN sm.payment_status != 'paid' THEN sm.payment ELSE 0 END)::integer AS total_unpaid
+      FROM shoot_members sm
+      JOIN projects p ON sm.project_id = p.id
+      JOIN users u ON sm.user_id = u.id
+      WHERE p.owner_id = ${userId}::uuid
+      GROUP BY LOWER(u.email)
+    `);
 
-    // 3. Fetch shoot days for owned projects
-    let ownedDays: any[] = [];
-    if (ownedProjectIds.length > 0) {
-      ownedDays = await db
-        .select()
-        .from(shootDays)
-        .where(inArray(shootDays.projectId, ownedProjectIds))
-        .orderBy(asc(shootDays.shootOrder));
-    }
+    // 5. Type definitions for raw SQL query results
+    interface OwnedProjectRow { project_month: string; budget: number; crew_payouts: number }
+    interface ExpenseRow { expense_month: string; total_amount: number }
+    interface MemberProjectRow { project_month: string; total_payment: number }
+    interface CrewPayoutRow { email: string; name: string; total_paid: number; total_unpaid: number }
 
-    // 4. Fetch shoot days for member projects
-    let memberDays: any[] = [];
-    if (memberProjectIds.length > 0) {
-      memberDays = await db
-        .select()
-        .from(shootDays)
-        .where(inArray(shootDays.projectId, memberProjectIds))
-        .orderBy(asc(shootDays.shootOrder));
-    }
-
-    // 5. Fetch expenses for owned projects
-    let ownedExpenses: any[] = [];
-    if (ownedProjectIds.length > 0) {
-      ownedExpenses = await db
-        .select()
-        .from(expenses)
-        .where(inArray(expenses.projectId, ownedProjectIds));
-    }
-
-    // 6. Fetch crew payments for owned projects
-    let ownedMembers: any[] = [];
-    if (ownedProjectIds.length > 0) {
-      ownedMembers = await db
-        .select({
-          id: shootMembers.id,
-          projectId: shootMembers.projectId,
-          payment: shootMembers.payment,
-          paymentStatus: shootMembers.paymentStatus,
-          userId: shootMembers.userId,
-          name: users.name,
-          email: users.email,
-        })
-        .from(shootMembers)
-        .leftJoin(users, eq(shootMembers.userId, users.id))
-        .where(inArray(shootMembers.projectId, ownedProjectIds));
-    }
-
-    // 7. Aggregate monthly financials
+    // 6. Aggregate monthly financials
     const monthlyData: Record<string, { revenue: number; expenses: number; crewPayouts: number; profit: number; ownedProfit: number; memberEarnings: number }> = {};
 
     const getMonthlyRecord = (month: string) => {
@@ -406,45 +446,36 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       return monthlyData[month];
     };
 
-    const getProjectMonth = (projId: string, createdAt: Date, days: any[]) => {
-      const projDays = days.filter((d) => d.projectId === projId);
-      if (projDays.length > 0) {
-        const firstDate = projDays[0].date; // YYYY-MM-DD
-        return firstDate.substring(0, 7); // YYYY-MM
-      }
-      return createdAt.toISOString().substring(0, 7); // YYYY-MM
-    };
-
-    // Process owned projects revenue & crew payouts
-    for (const proj of ownedProjects) {
-      const month = getProjectMonth(proj.id, proj.createdAt, ownedDays);
-      const rec = getMonthlyRecord(month);
-      rec.revenue += proj.budget;
-
-      const projMembers = ownedMembers.filter((m) => m.projectId === proj.id);
-      const totalPayout = projMembers.reduce((sum, m) => sum + m.payment, 0);
-      rec.crewPayouts += totalPayout;
+    // Process owned projects
+    for (const row of ownedProjectsQuery.rows as unknown as OwnedProjectRow[]) {
+      const month = row.project_month;
+      const budget = Number(row.budget || 0);
+      const crewPayouts = Number(row.crew_payouts || 0);
       
-      // ownedProfit: budget - crewPayouts
-      rec.ownedProfit += (proj.budget - totalPayout);
+      const rec = getMonthlyRecord(month);
+      rec.revenue += budget;
+      rec.crewPayouts += crewPayouts;
+      rec.ownedProfit += (budget - crewPayouts);
     }
 
     // Process expenses
-    for (const exp of ownedExpenses) {
-      const month = exp.date ? exp.date.substring(0, 7) : exp.createdAt.toISOString().substring(0, 7);
-      const rec = getMonthlyRecord(month);
-      rec.expenses += exp.amount;
+    for (const row of expensesQuery.rows as unknown as ExpenseRow[]) {
+      const month = row.expense_month;
+      const amount = Number(row.total_amount || 0);
       
-      // ownedProfit: subtract expenses
-      rec.ownedProfit -= exp.amount;
+      const rec = getMonthlyRecord(month);
+      rec.expenses += amount;
+      rec.ownedProfit -= amount;
     }
 
-    // Process member projects (payout rate is user's personal revenue)
-    for (const mp of memberProjects) {
-      const month = getProjectMonth(mp.project.id, mp.project.createdAt, memberDays);
+    // Process member projects
+    for (const row of memberProjectsQuery.rows as unknown as MemberProjectRow[]) {
+      const month = row.project_month;
+      const payment = Number(row.total_payment || 0);
+      
       const rec = getMonthlyRecord(month);
-      rec.revenue += mp.payment;
-      rec.memberEarnings += mp.payment;
+      rec.revenue += payment;
+      rec.memberEarnings += payment;
     }
 
     // Calculate profit
@@ -453,43 +484,26 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       rec.profit = rec.ownedProfit + rec.memberEarnings;
     }
 
-    // 8. Process crew payouts roster
-    const crewMap: Record<string, { name: string; email: string; initials: string; avatarColor: string; totalPaid: number; totalUnpaid: number }> = {};
+    // Process crew payouts roster
+    const crewPayoutsList = (crewPayoutsQuery.rows as unknown as CrewPayoutRow[]).map((row) => {
+      const email = row.email;
+      const name = row.name || email.split('@')[0];
+      const initials = getInitials(name);
+      const avatarColor = getAvatarColor(email);
 
-    for (const m of ownedMembers) {
-      if (!m.email) continue;
-      const email = m.email.toLowerCase();
-      if (!crewMap[email]) {
-        const name = m.name || m.email.split('@')[0];
-        const getInitials = (n: string) => n.split(' ').map((x) => x[0]).join('').substring(0, 2).toUpperCase();
-
-        let hash = 0;
-        for (let i = 0; i < email.length; i++) {
-          hash = email.charCodeAt(i) + ((hash << 5) - hash);
-        }
-        const colors = ['#7C3AED', '#10B981', '#F59E0B', '#EF4444', '#3B82F6', '#EC4899', '#8B5CF6'];
-        const avatarColor = colors[Math.abs(hash) % colors.length];
-
-        crewMap[email] = {
-          name,
-          email,
-          initials: getInitials(name),
-          avatarColor,
-          totalPaid: 0,
-          totalUnpaid: 0,
-        };
-      }
-
-      if (m.paymentStatus === 'paid') {
-        crewMap[email].totalPaid += m.payment;
-      } else {
-        crewMap[email].totalUnpaid += m.payment;
-      }
-    }
+      return {
+        name,
+        email,
+        initials,
+        avatarColor,
+        totalPaid: Number(row.total_paid || 0),
+        totalUnpaid: Number(row.total_unpaid || 0),
+      };
+    });
 
     return sendSuccess(res, 200, {
       timeSeries: Object.entries(monthlyData).map(([month, data]) => ({ month, ...data })),
-      crewPayouts: Object.values(crewMap),
+      crewPayouts: crewPayoutsList,
     }, 'Analytics data compiled successfully');
   } catch (error) {
     console.error('Error generating analytics:', error);
@@ -695,7 +709,7 @@ router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
     if (!Array.isArray(inputDays) || inputDays.length === 0)
       fields.shootDays = 'At least one shoot day is required';
     else
-      (inputDays as any[]).forEach((day, i) => {
+      (inputDays as Array<{ date: string; time?: string; locationName?: string; notes?: string }>).forEach((day, i) => {
         if (!day.date) fields[`shootDays[${i}].date`] = `Shoot day ${i + 1}: date is required`;
       });
 
@@ -718,7 +732,7 @@ router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
       .returning();
 
     // ── Insert shoot days ─────────────────────────────────────────────────
-    const dayValues = (inputDays as any[]).map((day, i) => ({
+    const dayValues = (inputDays as Array<{ date: string; time?: string; locationName?: string; locationJSON?: object; shootOrder?: number; notes?: string }>).map((day, i) => ({
       projectId: newProject.id,
       date: day.date as string,
       time: (day.time ?? '') as string,
@@ -957,16 +971,23 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     // 4. Shape
-    const shaped = rows.map((r) =>
-      shapeProject(
+    const shaped = rows.map((r) => {
+      const isOwner = r.project.ownerId === userId;
+      let project = shapeProject(
         r.project,
         r.ownerName || r.ownerEmail || r.project.ownerId,
         r.ownerEmail || '',
         daysByProject.get(r.project.id) ?? [],
         expensesByProject.get(r.project.id) ?? [],
         membersByProject.get(r.project.id) ?? []
-      )
-    );
+      );
+
+      if (!isOwner) {
+        project = stripProjectForMember(project, userId);
+      }
+
+      return project;
+    });
 
     // Sort final shaped projects to match the order of projectIds
     const shapedMap = new Map(shaped.map((p) => [p.id, p]));
@@ -1048,10 +1069,24 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .leftJoin(users, eq(shootMembers.userId, users.id))
       .where(eq(shootMembers.projectId, id));
 
+    const isOwner = projectData.project.ownerId === userId;
+    let shapedProject = shapeProject(
+      projectData.project,
+      projectData.ownerName || projectData.ownerEmail || projectData.project.ownerId,
+      projectData.ownerEmail ?? '',
+      days,
+      exps,
+      members
+    );
+
+    if (!isOwner) {
+      shapedProject = stripProjectForMember(shapedProject, userId);
+    }
+
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(projectData.project, projectData.ownerName || projectData.ownerEmail || projectData.project.ownerId, projectData.ownerEmail ?? '', days, exps, members) },
+      { project: shapedProject },
       'Project fetched successfully'
     );
   } catch (error) {
@@ -1173,9 +1208,8 @@ router.post('/projects/:projectId/days', async (req: AuthenticatedRequest, res: 
     const projectId = String(req.params.projectId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const { date, time, locationJSON, shootOrder, eventTitle } = req.body;
 
@@ -1203,9 +1237,8 @@ router.put('/projects/:projectId/days/:dayId', async (req: AuthenticatedRequest,
     const dayId = String(req.params.dayId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const { date, time, locationJSON, shootOrder, eventTitle } = req.body;
 
@@ -1234,9 +1267,8 @@ router.delete('/projects/:projectId/days/:dayId', async (req: AuthenticatedReque
     const dayId = String(req.params.dayId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const [deletedDay] = await db.delete(shootDays)
       .where(and(eq(shootDays.id, dayId), eq(shootDays.projectId, projectId)))
@@ -1258,9 +1290,8 @@ router.get('/projects/:projectId/expenses', async (req: AuthenticatedRequest, re
     const projectId = String(req.params.projectId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const exps = await db
       .select()
@@ -1290,9 +1321,8 @@ router.post('/projects/:projectId/expenses', async (req: AuthenticatedRequest, r
     const projectId = String(req.params.projectId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const { label, amount, category, date } = req.body;
 
@@ -1332,6 +1362,33 @@ router.post('/projects/:projectId/expenses', async (req: AuthenticatedRequest, r
   }
 });
 
+// DELETE /projects/:projectId/expenses/:expenseId
+router.delete('/projects/:projectId/expenses/:expenseId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const expenseId = String(req.params.expenseId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const [deletedExpense] = await db
+      .delete(expenses)
+      .where(and(eq(expenses.id, expenseId), eq(expenses.projectId, projectId)))
+      .returning();
+
+    if (!deletedExpense) {
+      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Expense not found' });
+    }
+
+    return sendSuccess(res, 200, {}, 'Expense deleted successfully');
+  } catch (error) {
+    console.error('Error deleting expense:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete expense' });
+  }
+});
+
 // ─── Team Members / Crew Endpoints ──────────────────────────────────────────
 
 // POST /projects/:projectId/members
@@ -1341,9 +1398,8 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
     const projectId = String(req.params.projectId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     // Fetch project owner and project shoot dates for the invitation email
     const [owner] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
@@ -1426,17 +1482,15 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
         });
       }
 
-      results.push({
+      results.push(shapeTeamMember({
         id: newMember.id,
         userId: targetUser.id,
         name: targetUser.name || null,
         email: targetUser.email,
-        initials: getInitials(targetUser.name || targetUser.email),
         payment: newMember.payment,
-        paymentStatus: (newMember.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+        paymentStatus: newMember.paymentStatus,
         invited: newMember.invited,
-        avatarColor: getAvatarColor(targetUser.email),
-      });
+      }));
     }
 
     return sendSuccess(res, 201, { members: results }, 'Team member(s) added successfully');
@@ -1454,9 +1508,8 @@ router.put('/projects/:projectId/members/:memberId', async (req: AuthenticatedRe
     const memberId = String(req.params.memberId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const { payment, paymentStatus, invited } = req.body;
 
@@ -1480,17 +1533,15 @@ router.put('/projects/:projectId/members/:memberId', async (req: AuthenticatedRe
       email: users.email,
     }).from(users).where(eq(users.id, updatedMember.userId!)).limit(1);
 
-    const shapedMember = {
+    const shapedMember = shapeTeamMember({
       id: updatedMember.id,
       userId: updatedMember.userId,
       name: user?.name || null,
       email: user?.email ?? '',
-      initials: getInitials((user?.name || user?.email) ?? ''),
       payment: updatedMember.payment,
-      paymentStatus: (updatedMember.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+      paymentStatus: updatedMember.paymentStatus,
       invited: updatedMember.invited,
-      avatarColor: getAvatarColor(user?.email ?? ''),
-    };
+    });
 
     return sendSuccess(res, 200, { member: shapedMember }, 'Team member updated successfully');
   } catch (error) {
@@ -1507,9 +1558,8 @@ router.delete('/projects/:projectId/members/:memberId', async (req: Authenticate
     const memberId = String(req.params.memberId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    // Validate project ownership
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, userId))).limit(1);
-    if (!project) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
 
     const [deletedMember] = await db.delete(shootMembers)
       .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId)))
@@ -1602,34 +1652,6 @@ router.delete('/team-members/:memberId', async (req: AuthenticatedRequest, res: 
   } catch (error) {
     console.error('Error removing team member from circle:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to remove team member from circle' });
-  }
-});
-
-// DELETE /projects/:id
-router.delete('/projects/:id', async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const userId = req.user?.userId;
-    const id = String(req.params.id);
-    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
-
-    // Validate project ownership (only owner can delete)
-    const [project] = await db
-      .select()
-      .from(projects)
-      .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
-      .limit(1);
-
-    if (!project) {
-      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found or you are not the owner' });
-    }
-
-    // Delete the project (associated shootDays, shootMembers, and expenses will cascade delete automatically)
-    await db.delete(projects).where(eq(projects.id, id));
-
-    return sendSuccess(res, 200, {}, 'Project deleted successfully');
-  } catch (error) {
-    console.error('Error deleting project:', error);
-    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete project' });
   }
 });
 

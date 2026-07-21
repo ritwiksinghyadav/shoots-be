@@ -1,9 +1,10 @@
 import { Response } from 'express';
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function sendSuccess(
   res: Response,
   statusCode: number,
-  result: any,
+  result: unknown,
   message: string = 'Success'
 ) {
   return res.status(statusCode).json({
