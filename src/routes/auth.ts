@@ -363,6 +363,46 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
 });
 
 
+// GET /auth/verify-reset-token
+router.get('/auth/verify-reset-token', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token || typeof token !== 'string') {
+      return sendError(res, 400, {
+        code: 'INVALID_TOKEN',
+        message: 'Security token is missing or invalid.',
+      });
+    }
+
+    const now = new Date();
+    const [user] = await db
+      .select({ email: users.email })
+      .from(users)
+      .where(
+        and(
+          eq(users.resetToken, token),
+          gt(users.resetTokenExpiry, now)
+        )
+      )
+      .limit(1);
+
+    if (!user) {
+      return sendError(res, 400, {
+        code: 'INVALID_TOKEN',
+        message: 'This password reset link is invalid or has expired.',
+      });
+    }
+
+    return sendSuccess(res, 200, { valid: true, email: user.email }, 'Reset token is valid.');
+  } catch (error) {
+    console.error('Verify reset token error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred while verifying the token.',
+    });
+  }
+});
+
 // POST /auth/forgot-password
 router.post('/auth/forgot-password', async (req, res) => {
   console.log(`[POST] /auth/forgot-password request received for email: ${req.body?.email}`);
@@ -408,7 +448,8 @@ router.post('/auth/forgot-password', async (req, res) => {
       .where(eq(users.id, user.id));
 
     // Send email
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3005';
+    const origin = req.headers.origin as string | undefined;
+    const frontendUrl = process.env.FRONTEND_URL || origin || 'http://localhost:3005';
     const resetLink = `${frontendUrl}/reset-password?token=${token}`;
     
     const emailSent = await sendPasswordResetEmail(cleanEmail, resetLink);
