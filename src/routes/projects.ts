@@ -1431,7 +1431,6 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
 
       // 1. Search for user by email
       let [targetUser] = await db.select().from(users).where(eq(users.email, targetEmail)).limit(1);
-      let isNewUser = false;
 
       if (!targetUser) {
         // 1.1 Create user if not in database
@@ -1440,14 +1439,24 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
           invitedBy: userId,
         }).returning();
         targetUser = newUser;
-        isNewUser = true;
       }
 
-      if (isNewUser) {
-        sendInvitationEmail(targetEmail, ownerName, project.title, project.client, shootDates).catch((err) => {
-          console.error(`Failed to send invitation email to ${targetEmail}:`, err);
-        });
-      }
+      // A crew member can be invited to multiple projects over time — a user
+      // row created by an earlier invite (or one who registered but never
+      // finished setup) still won't have a password, so this checks the real
+      // account state rather than "was this row just created right now".
+      const needsPasswordSetup = !targetUser.passwordHash;
+      sendInvitationEmail(
+        targetEmail,
+        ownerName,
+        project.title,
+        project.client,
+        shootDates,
+        needsPasswordSetup,
+        projectId
+      ).catch((err) => {
+        console.error(`Failed to send invitation email to ${targetEmail}:`, err);
+      });
 
       // 2. Check if already a member of this project
       const [existingMember] = await db.select().from(shootMembers).where(and(

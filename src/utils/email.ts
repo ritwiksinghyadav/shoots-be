@@ -29,7 +29,9 @@ export async function sendInvitationEmail(
   ownerName: string,
   projectName: string,
   clientName: string,
-  shootDates: string[]
+  shootDates: string[],
+  needsPasswordSetup: boolean,
+  projectId: string
 ): Promise<boolean> {
   if (!BREVO_API_KEY) {
     console.warn('sendInvitationEmail: BREVO_API_KEY is not defined. Skipping email sending.');
@@ -43,6 +45,31 @@ export async function sendInvitationEmail(
     : 'TBD';
 
   const client = new BrevoClient({ apiKey: BREVO_API_KEY });
+
+  // First-time / no-password-yet invitees can't sign in directly — point them
+  // at the Forgot Password page to claim a password first. Everyone else
+  // already has credentials, so send them straight to the project (via the
+  // login page's callbackUrl, which redirects here once they're signed in).
+  const forgotPasswordUrl = `${FRONTEND_URL}/forgot-password`;
+  const projectUrl = `${FRONTEND_URL}/login?callbackUrl=${encodeURIComponent(`/shoots/${projectId}`)}`;
+
+  const introParagraph = needsPasswordSetup
+    ? `You have been added to a photography project by <strong>${ownerName}</strong>. Since this is your first time on SHOOTS, you'll need to set a password before you can sign in. Here are the project details:`
+    : `You have been added to a photography project by <strong>${ownerName}</strong>. Here are the details of the project:`;
+
+  const ctaSection = needsPasswordSetup
+    ? `
+        <p>Click below to go to the <strong>Forgot Password</strong> page and enter your email (<strong>${toEmail}</strong>) — we'll send you a one-time link to set your password and sign in.</p>
+        <div class="btn-container">
+          <a href="${forgotPasswordUrl}" class="btn">Set Your Password</a>
+        </div>
+      `
+    : `
+        <p>We welcome you to continue browsing your projects, tracking schedules, and payments on SHOOTS.</p>
+        <div class="btn-container">
+          <a href="${projectUrl}" class="btn">View Project</a>
+        </div>
+      `;
 
   const htmlContent = `
     <!DOCTYPE html>
@@ -146,8 +173,8 @@ export async function sendInvitationEmail(
         <div class="logo">📷 SHOOTS</div>
         <h1>New Project Assignment</h1>
         <p>Hi there,</p>
-        <p>You have been added to a photography project by <strong>${ownerName}</strong>. Here are the details of the project:</p>
-        
+        <p>${introParagraph}</p>
+
         <div class="details-card">
           <div class="details-row">
             <span class="details-label">Project</span>
@@ -163,12 +190,8 @@ export async function sendInvitationEmail(
           </div>
         </div>
 
-        <p>We welcome you to continue browsing your projects, tracking schedules, and payments on SHOOTS.</p>
-        
-        <div class="btn-container">
-          <a href="${FRONTEND_URL}/login" class="btn">Access Project</a>
-        </div>
-        
+        ${ctaSection}
+
         <div class="footer-note">
           This invitation was sent from SHOOTS because your email was added to a project crew.
         </div>
