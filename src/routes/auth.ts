@@ -309,7 +309,7 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
-    const { name, businessName, password, preferredCurrency } = req.body;
+    const { name, businessName, password, currentPassword, preferredCurrency } = req.body;
 
     // Validation
     const fields: Record<string, string> = {};
@@ -340,7 +340,45 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     if (name !== undefined) updatePayload.name = name.trim();
     if (businessName !== undefined) updatePayload.businessName = businessName?.trim() || null;
     if (preferredCurrency !== undefined) updatePayload.preferredCurrency = preferredCurrency;
+
     if (password !== undefined && password !== null) {
+      const [existing] = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1);
+
+      if (!existing) {
+        return sendError(res, 404, {
+          code: 'NOT_FOUND',
+          message: 'User not found',
+        });
+      }
+
+      // Only demand the current password when the account already has one.
+      // A hijacked session (stolen access token, XSS, etc.) can otherwise set
+      // a brand new password with no proof of the old one, silently locking
+      // the real owner out. Accounts that never had a password (e.g. crew
+      // members created via invite) are setting one for the first time, so
+      // there's nothing to verify against yet.
+      if (existing.passwordHash) {
+        if (!currentPassword || typeof currentPassword !== 'string') {
+          return sendError(res, 400, {
+            code: 'VALIDATION_ERROR',
+            message: 'Validation failed',
+            fields: { currentPassword: 'Current password is required to set a new password' },
+          });
+        }
+        const isMatch = await comparePassword(currentPassword, existing.passwordHash);
+        if (!isMatch) {
+          return sendError(res, 400, {
+            code: 'VALIDATION_ERROR',
+            message: 'Validation failed',
+            fields: { currentPassword: 'Current password is incorrect' },
+          });
+        }
+      }
+
       updatePayload.passwordHash = await hashPassword(password);
     }
 
