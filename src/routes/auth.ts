@@ -18,11 +18,12 @@ const router = Router();
 
 // Helper to set refresh token cookie
 const setRefreshTokenCookie = (res: Response, token: string) => {
+  const isProd = process.env.NODE_ENV === 'production';
   res.cookie('refreshToken', token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: 60 * 24 * 60 * 60 * 1000, // 60 days
+    secure: isProd,                       // HTTPS only in prod
+    sameSite: isProd ? 'none' : 'lax',   // 'none' allows cross-site in prod (Vercel → Render)
+    maxAge: 60 * 24 * 60 * 60 * 1000,   // 60 days in ms
   });
 };
 
@@ -245,10 +246,11 @@ router.post('/auth/refresh', async (req, res) => {
 
 // POST /auth/logout
 router.post('/auth/logout', (req, res) => {
+  const isProd = process.env.NODE_ENV === 'production';
   res.clearCookie('refreshToken', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
   });
   return sendSuccess(res, 200, {}, 'Logged out successfully');
 });

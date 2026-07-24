@@ -210,8 +210,7 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
           ),
           gte(shootDays.date, todayStr),
           lte(shootDays.date, oneMonthLaterStr),
-          ne(projects.status, 'done'),
-          ne(projects.status, 'cancelled')
+          ne(projects.status, 'paid')
         )
       )
       .orderBy(asc(shootDays.date), asc(shootDays.time));
