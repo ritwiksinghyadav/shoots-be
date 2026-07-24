@@ -99,6 +99,7 @@ router.post('/auth/register', async (req, res) => {
     return sendSuccess(res, 201, {
       user: userWithoutPassword,
       accessToken,
+      refreshToken,
     }, 'User registered successfully');
   } catch (error) {
     console.error('Registration error:', error);
@@ -177,6 +178,7 @@ router.post('/auth/login', async (req, res) => {
     return sendSuccess(res, 200, {
       user: userWithoutPassword,
       accessToken,
+      refreshToken,
     }, 'Logged in successfully');
   } catch (error) {
     console.error('Login error:', error);
@@ -191,7 +193,10 @@ router.post('/auth/login', async (req, res) => {
 router.post('/auth/refresh', async (req, res) => {
   console.log('[POST] /auth/refresh request received');
   try {
-    const refreshToken = req.cookies?.refreshToken;
+    const refreshToken =
+      req.cookies?.refreshToken ||
+      req.body?.refreshToken ||
+      (req.headers['x-refresh-token'] as string);
 
     if (!refreshToken) {
       return sendError(res, 401, {
@@ -234,6 +239,7 @@ router.post('/auth/refresh', async (req, res) => {
 
     return sendSuccess(res, 200, {
       accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
     }, 'Token refreshed successfully');
   } catch (error) {
     console.error('Refresh token error:', error);
