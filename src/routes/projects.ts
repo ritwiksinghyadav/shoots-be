@@ -1598,6 +1598,7 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
         id: users.id,
         name: users.name,
         email: users.email,
+        firstLogin: users.firstLogin,
       })
       .from(teamMembers)
       .innerJoin(users, eq(teamMembers.memberId, users.id))
@@ -1633,6 +1634,10 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
         email: r.email,
         initials: getInitials(r.name || r.email),
         avatarColor: getAvatarColor(r.email),
+        // Stored as smallint, defaulting to 1 ("first login still pending")
+        // for every new/never-logged-in account — see the serializeUser()
+        // comment in routes/auth.ts. So 0 → onboarded, 1 → not yet.
+        firstLogin: r.firstLogin === 0,
         isAvailable: datesQuery ? isAvailable : undefined,
         busyOn: datesQuery && !isAvailable ? userBookings.map((b) => ({ date: b.date, projectTitle: b.projectTitle })) : undefined,
       };

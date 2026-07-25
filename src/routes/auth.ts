@@ -16,6 +16,24 @@ import { sendPasswordResetEmail } from '../utils/email.js';
 
 const router = Router();
 
+type UserRow = typeof users.$inferSelect;
+
+/**
+ * Shapes a raw `users` row for API responses: strips the password hash and
+ * converts the `first_login` smallint column to a proper JSON boolean.
+ *
+ * IMPORTANT — the column defaults to 1 for every newly created account
+ * (both self-registered and auto-created-via-invite), meaning "this
+ * account's first login is still pending". So `1` → API `false` ("hasn't
+ * completed onboarding yet") and `0` → API `true` ("has completed it").
+ * This is the inverse of the naive 1=true/0=false reading — get it backwards
+ * and every brand-new account reports as already onboarded.
+ */
+function serializeUser(user: UserRow) {
+  const { passwordHash: _passwordHash, firstLogin, ...rest } = user;
+  return { ...rest, firstLogin: firstLogin === 0 };
+}
+
 // Helper to set refresh token cookie
 const setRefreshTokenCookie = (res: Response, token: string) => {
   const isProd = process.env.NODE_ENV === 'production';
@@ -95,9 +113,8 @@ router.post('/auth/register', async (req, res) => {
     // 6. Set cookie & return response
     setRefreshTokenCookie(res, refreshToken);
 
-    const { passwordHash: _, ...userWithoutPassword } = newUser;
     return sendSuccess(res, 201, {
-      user: userWithoutPassword,
+      user: serializeUser(newUser),
       accessToken,
       refreshToken,
     }, 'User registered successfully');
@@ -174,9 +191,8 @@ router.post('/auth/login', async (req, res) => {
     // 5. Set cookie & return response
     setRefreshTokenCookie(res, refreshToken);
 
-    const { passwordHash: _, ...userWithoutPassword } = user;
     return sendSuccess(res, 200, {
-      user: userWithoutPassword,
+      user: serializeUser(user),
       accessToken,
       refreshToken,
     }, 'Logged in successfully');
@@ -285,9 +301,8 @@ router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
-    const { passwordHash: _, ...userWithoutPassword } = user;
     return sendSuccess(res, 200, {
-      user: userWithoutPassword,
+      user: serializeUser(user),
     }, 'User profile fetched successfully');
   } catch (error) {
     console.error('Get profile error:', error);
@@ -309,7 +324,7 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
-    const { name, businessName, password, currentPassword, preferredCurrency } = req.body;
+    const { name, businessName, password, currentPassword, preferredCurrency, firstLogin } = req.body;
 
     // Validation
     const fields: Record<string, string> = {};
@@ -323,6 +338,9 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     if (preferredCurrency !== undefined && !VALID_CURRENCIES.includes(preferredCurrency)) {
       fields.preferredCurrency = 'Invalid currency code';
     }
+    if (firstLogin !== undefined && typeof firstLogin !== 'boolean') {
+      fields.firstLogin = 'firstLogin must be a boolean';
+    }
 
     if (Object.keys(fields).length > 0) {
       return sendError(res, 400, {
@@ -333,13 +351,18 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     }
 
     // Prepare update payload
-    type UserUpdateData = Partial<Pick<typeof users.$inferInsert, 'name' | 'businessName' | 'preferredCurrency' | 'passwordHash'>> & { updatedAt: Date };
+    type UserUpdateData = Partial<Pick<typeof users.$inferInsert, 'name' | 'businessName' | 'preferredCurrency' | 'passwordHash' | 'firstLogin'>> & { updatedAt: Date };
     const updatePayload: UserUpdateData = {
       updatedAt: new Date(),
     };
     if (name !== undefined) updatePayload.name = name.trim();
     if (businessName !== undefined) updatePayload.businessName = businessName?.trim() || null;
     if (preferredCurrency !== undefined) updatePayload.preferredCurrency = preferredCurrency;
+    // Stored as smallint in the DB — see schema.ts — inverted: API `true`
+    // ("onboarding complete") writes 0, API `false` writes 1. See the
+    // serializeUser() comment above for why the column's own default forces
+    // this inversion. The 0/1 encoding never leaves this file.
+    if (firstLogin !== undefined) updatePayload.firstLogin = firstLogin ? 0 : 1;
 
     if (password !== undefined && password !== null) {
       const [existing] = await db
@@ -395,9 +418,8 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
-    const { passwordHash: _, ...userWithoutPassword } = updatedUser;
     return sendSuccess(res, 200, {
-      user: userWithoutPassword,
+      user: serializeUser(updatedUser),
     }, 'Profile updated successfully');
   } catch (error) {
     console.error('Update profile error:', error);
