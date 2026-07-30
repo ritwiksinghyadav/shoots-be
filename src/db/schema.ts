@@ -90,6 +90,17 @@ export const expenses = pgTable('expenses', {
   updatedAt: updatedAt(),
 });
 
+export const feedback = pgTable('feedback', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  /** 'feedback' | 'bug' — kept as free text rather than a pg enum so new types don't need a migration. */
+  type: text('type').notNull().default('feedback'),
+  message: text('message').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('feedback_user_created_idx').on(table.userId, table.createdAt),
+]);
+
 export const teamMembers = pgTable('team_members', {
   id: uuid('id').defaultRandom().primaryKey(),
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
