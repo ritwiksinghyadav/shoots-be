@@ -18,6 +18,8 @@ export const users = pgTable('users', {
   email: text('email').notNull().unique(),
   passwordHash: text('password_hash'),
   businessName: text('business_name'),
+  /** E.164-style, e.g. "+919876543210". Null until the user sets one. */
+  phone: text('phone'),
   preferredCurrency: text('preferred_currency').notNull().default('USD'),
   invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
   firstLogin: smallint('first_login').default(1).notNull(),

@@ -324,12 +324,15 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
-    const { name, businessName, password, currentPassword, preferredCurrency, firstLogin } = req.body;
+    const { name, businessName, phone, password, currentPassword, preferredCurrency, firstLogin } = req.body;
 
     // Validation
     const fields: Record<string, string> = {};
     if (name !== undefined && (!name || typeof name !== 'string' || !name.trim())) {
       fields.name = 'Name cannot be empty';
+    }
+    if (phone !== undefined && phone !== null && typeof phone !== 'string') {
+      fields.phone = 'Phone must be a string';
     }
     if (password !== undefined && password !== null && (typeof password !== 'string' || password.length < 8)) {
       fields.password = 'Password must be at least 8 characters';
@@ -351,12 +354,13 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     }
 
     // Prepare update payload
-    type UserUpdateData = Partial<Pick<typeof users.$inferInsert, 'name' | 'businessName' | 'preferredCurrency' | 'passwordHash' | 'firstLogin'>> & { updatedAt: Date };
+    type UserUpdateData = Partial<Pick<typeof users.$inferInsert, 'name' | 'businessName' | 'phone' | 'preferredCurrency' | 'passwordHash' | 'firstLogin'>> & { updatedAt: Date };
     const updatePayload: UserUpdateData = {
       updatedAt: new Date(),
     };
     if (name !== undefined) updatePayload.name = name.trim();
     if (businessName !== undefined) updatePayload.businessName = businessName?.trim() || null;
+    if (phone !== undefined) updatePayload.phone = phone?.trim() || null;
     if (preferredCurrency !== undefined) updatePayload.preferredCurrency = preferredCurrency;
     // Stored as smallint in the DB — see schema.ts — inverted: API `true`
     // ("onboarding complete") writes 0, API `false` writes 1. See the

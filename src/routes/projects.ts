@@ -1598,6 +1598,7 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
         id: users.id,
         name: users.name,
         email: users.email,
+        phone: users.phone,
         firstLogin: users.firstLogin,
       })
       .from(teamMembers)
@@ -1632,6 +1633,7 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
         id: r.id,
         name: r.name,
         email: r.email,
+        phone: r.phone,
         initials: getInitials(r.name || r.email),
         avatarColor: getAvatarColor(r.email),
         // Stored as smallint, defaulting to 1 ("first login still pending")
