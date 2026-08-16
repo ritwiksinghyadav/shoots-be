@@ -20,6 +20,14 @@ export const users = pgTable('users', {
   businessName: text('business_name'),
   /** E.164-style, e.g. "+919876543210". Null until the user sets one. */
   phone: text('phone'),
+  /**
+   * Free-text profession (UI label: "Profession") — the frontend offers
+   * suggestions via a Combobox but doesn't restrict the value to them.
+   * Nullable at the DB level so existing rows survive the migration, but
+   * treated as mandatory by the application: enforced client-side in
+   * onboarding/profile forms and validated server-side in `PUT /auth/me`.
+   */
+  occupation: text('occupation'),
   preferredCurrency: text('preferred_currency').notNull().default('USD'),
   invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
   firstLogin: smallint('first_login').default(1).notNull(),
