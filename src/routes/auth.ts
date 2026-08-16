@@ -491,7 +491,13 @@ router.post('/auth/forgot-password', async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    // Check if user is present
+    // The response below is intentionally identical whether or not an
+    // account exists for this email. Returning a distinct 404 (or a
+    // distinct error when the send fails) would let anyone probe arbitrary
+    // addresses to learn which ones have accounts on the platform.
+    const genericResponse = () =>
+      sendSuccess(res, 200, {}, 'If an account exists for this email, a password reset link has been sent.');
+
     const [user] = await db
       .select()
       .from(users)
@@ -499,11 +505,7 @@ router.post('/auth/forgot-password', async (req, res) => {
       .limit(1);
 
     if (!user) {
-      return sendError(res, 404, {
-        code: 'NOT_FOUND',
-        message: 'No account found with this email address.',
-        fields: { email: 'No account found with this email address.' },
-      });
+      return genericResponse();
     }
 
     // Create one-time use token
@@ -523,16 +525,16 @@ router.post('/auth/forgot-password', async (req, res) => {
     const origin = req.headers.origin as string | undefined;
     const frontendUrl = process.env.FRONTEND_URL || origin || 'http://localhost:3005';
     const resetLink = `${frontendUrl}/reset-password?token=${token}`;
-    
+
     const emailSent = await sendPasswordResetEmail(cleanEmail, resetLink);
     if (!emailSent) {
-      return sendError(res, 500, {
-        code: 'EMAIL_SEND_FAILED',
-        message: 'Failed to send password reset email. Please try again later.',
-      });
+      // Log for ops visibility only — the caller still gets the generic
+      // response so a send failure can't be used to distinguish real
+      // accounts from nonexistent ones.
+      console.error(`Forgot password: failed to send reset email to ${cleanEmail}`);
     }
 
-    return sendSuccess(res, 200, {}, 'Password reset email sent successfully.');
+    return genericResponse();
   } catch (error) {
     console.error('Forgot password error:', error);
     return sendError(res, 500, {

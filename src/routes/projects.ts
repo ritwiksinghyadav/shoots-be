@@ -1441,6 +1441,18 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
         targetUser = newUser;
       }
 
+      // 2. Check if already a member of this project — skip before sending
+      // any email so a retried/duplicate request doesn't re-notify someone
+      // who's already on the crew.
+      const [existingMember] = await db.select().from(shootMembers).where(and(
+        eq(shootMembers.projectId, projectId),
+        eq(shootMembers.userId, targetUser.id)
+      )).limit(1);
+
+      if (existingMember) {
+        continue;
+      }
+
       // A crew member can be invited to multiple projects over time — a user
       // row created by an earlier invite (or one who registered but never
       // finished setup) still won't have a password, so this checks the real
@@ -1457,16 +1469,6 @@ router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, re
       ).catch((err) => {
         console.error(`Failed to send invitation email to ${targetEmail}:`, err);
       });
-
-      // 2. Check if already a member of this project
-      const [existingMember] = await db.select().from(shootMembers).where(and(
-        eq(shootMembers.projectId, projectId),
-        eq(shootMembers.userId, targetUser.id)
-      )).limit(1);
-
-      if (existingMember) {
-        continue;
-      }
 
       // 3. Map user with project
       const [newMember] = await db.insert(shootMembers).values({

@@ -50,7 +50,7 @@ export async function sendInvitationEmail(
   // at the Forgot Password page to claim a password first. Everyone else
   // already has credentials, so send them straight to the project (via the
   // login page's callbackUrl, which redirects here once they're signed in).
-  const forgotPasswordUrl = `${FRONTEND_URL}/forgot-password`;
+  const forgotPasswordUrl = `${FRONTEND_URL}/forgot-password?email=${encodeURIComponent(toEmail)}`;
   const projectUrl = `${FRONTEND_URL}/login?callbackUrl=${encodeURIComponent(`/shoots/${projectId}`)}`;
 
   const introParagraph = needsPasswordSetup
