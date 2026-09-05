@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import authRouter from './routes/auth.js';
 import projectsRouter from './routes/projects.js';
 import feedbackRouter from './routes/feedback.js';
+import publicRouter from './routes/public.js';
 import { sendSuccess, sendError } from './utils/response.js';
 import { db } from './db/index.js';
 import { sql } from 'drizzle-orm';
@@ -45,6 +46,7 @@ app.use(cookieParser());
 
 // Mount API routes
 app.use('/api/v1', authRouter);
+app.use('/api/v1', publicRouter);
 app.use('/api/v1', projectsRouter);
 app.use('/api/v1', feedbackRouter);
 

@@ -228,6 +228,139 @@ export async function sendInvitationEmail(
   }
 }
 
+export async function sendSignupVerificationEmail(
+  toEmail: string,
+  verifyLink: string
+): Promise<boolean> {
+  if (!BREVO_API_KEY) {
+    console.warn('sendSignupVerificationEmail: BREVO_API_KEY is not defined. Skipping email sending.');
+    return false;
+  }
+
+  const client = new BrevoClient({ apiKey: BREVO_API_KEY });
+
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Verify your email</title>
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          background-color: #FAFAF8;
+          color: #1C1917;
+          padding: 40px 20px;
+          margin: 0;
+        }
+        .container {
+          max-width: 500px;
+          margin: 0 auto;
+          background-color: #FFFFFF;
+          border: 1px solid #E7E5E4;
+          border-radius: 20px;
+          padding: 36px;
+          box-shadow: 0 4px 12px rgba(28, 25, 23, 0.03);
+        }
+        .logo {
+          font-weight: 800;
+          font-size: 16px;
+          letter-spacing: -0.025em;
+          margin-bottom: 28px;
+          color: #1C1917;
+        }
+        h1 {
+          font-size: 22px;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          margin-top: 0;
+          margin-bottom: 16px;
+          color: #1C1917;
+        }
+        p {
+          font-size: 14px;
+          line-height: 1.6;
+          color: #44403C;
+          margin-top: 0;
+          margin-bottom: 24px;
+        }
+        .btn-container {
+          text-align: center;
+          margin-top: 28px;
+          margin-bottom: 12px;
+        }
+        .btn {
+          display: inline-block;
+          background-color: #1C1917;
+          color: #FFFFFF !important;
+          text-decoration: none;
+          padding: 12px 28px;
+          border-radius: 9999px;
+          font-size: 13px;
+          font-weight: 600;
+          text-align: center;
+          transition: background-color 150ms ease;
+        }
+        .footer-note {
+          font-size: 12px;
+          color: #A8A29E;
+          text-align: center;
+          margin-top: 32px;
+          line-height: 1.5;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="logo">📷 SHOOTS</div>
+        <h1>Verify your email</h1>
+        <p>Welcome to SHOOTS! Click the button below to verify your email and set a password — this finishes creating your account. This link is valid for 1 hour.</p>
+
+        <div class="btn-container">
+          <a href="${verifyLink}" class="btn">Verify Email &amp; Set Password</a>
+        </div>
+
+        <p style="font-size: 12px; color: #78716C; margin-top: 20px; word-break: break-all;">
+          If the button doesn't work, copy and paste this URL into your browser: <br/>
+          <a href="${verifyLink}" style="color: #1C1917; text-decoration: underline;">${verifyLink}</a>
+        </p>
+
+        <div class="footer-note">
+          If you did not try to sign up for SHOOTS, you can safely ignore this email.
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const emailData: Brevo.SendTransacEmailRequest = {
+    subject: 'Verify your email to finish signing up on SHOOTS',
+    htmlContent,
+    to: [{ email: toEmail }],
+    sender: {
+      name: SENDER_NAME,
+      email: SENDER_EMAIL
+    }
+  };
+
+  try {
+    const res = await client.transactionalEmails.sendTransacEmail(emailData);
+    console.log(`Successfully sent signup verification email to ${toEmail} via Brevo SDK. Response:`, res);
+    return true;
+  } catch (error) {
+    if (error instanceof Brevo.UnauthorizedError) {
+      console.error('Brevo API Error: Invalid API key or IP address restriction (UnauthorizedError)');
+    } else if (error instanceof Brevo.TooManyRequestsError) {
+      console.error('Brevo API Error: Rate limited (TooManyRequestsError)');
+    } else if (error instanceof BrevoError) {
+      console.error(`Brevo API Error ${error.statusCode}:`, error.message);
+    } else {
+      console.error(`Error sending signup verification email to ${toEmail} via Brevo SDK:`, error);
+    }
+    return false;
+  }
+}
+
 export async function sendPasswordResetEmail(
   toEmail: string,
   resetLink: string

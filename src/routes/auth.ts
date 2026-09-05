@@ -12,7 +12,7 @@ import {
 } from '../utils/auth.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
-import { sendPasswordResetEmail } from '../utils/email.js';
+import { sendPasswordResetEmail, sendSignupVerificationEmail } from '../utils/email.js';
 
 const router = Router();
 
@@ -123,6 +123,81 @@ router.post('/auth/register', async (req, res) => {
     return sendError(res, 500, {
       code: 'INTERNAL_SERVER_ERROR',
       message: 'An unexpected error occurred during registration',
+    });
+  }
+});
+
+// POST /auth/signup-request — step 1 of the email-first signup flow: check
+// the email, and if it can't sign in yet, (re)send a verify-and-set-password
+// link. Reuses the exact same resetToken/resetTokenExpiry mechanism as
+// forgot-password — a crew member invited before ever signing up already
+// goes through this same "no password yet, click a link to set one" path,
+// so this just reuses that instead of building parallel plumbing.
+router.post('/auth/signup-request', async (req, res) => {
+  console.log(`[POST] /auth/signup-request request received for email: ${req.body?.email}`);
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      return sendError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Email is required',
+        fields: { email: 'Email is required' },
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    let [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, cleanEmail))
+      .limit(1);
+
+    // A real, usable account already exists — nothing to verify, they
+    // should sign in instead.
+    if (user && user.passwordHash) {
+      return sendSuccess(res, 200, { requiresSignIn: true }, 'An account with this email already exists.');
+    }
+
+    // No row yet — create the placeholder now (mirrors the row the invite
+    // flow creates for an email added to a project before it ever signs up).
+    if (!user) {
+      [user] = await db
+        .insert(users)
+        .values({ email: cleanEmail })
+        .returning();
+    }
+
+    // Either brand new, or an existing invited-but-never-signed-up row —
+    // both need the same "click to verify and set a password" link.
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await db
+      .update(users)
+      .set({ resetToken: token, resetTokenExpiry: expiry })
+      .where(eq(users.id, user.id));
+
+    const origin = req.headers.origin as string | undefined;
+    const frontendUrl = process.env.FRONTEND_URL || origin || 'http://localhost:3005';
+    // `signup=1` lets the reset-password page phrase its expired/invalid-link
+    // screen as "resume signup" rather than "request a password reset" even
+    // when the token itself can no longer tell it that (verify-token has
+    // nothing to look up once the token's already invalid).
+    const verifyLink = `${frontendUrl}/reset-password?token=${token}&signup=1`;
+
+    const emailSent = await sendSignupVerificationEmail(cleanEmail, verifyLink);
+    if (!emailSent) {
+      console.error(`Signup request: failed to send verification email to ${cleanEmail}`);
+    }
+
+    return sendSuccess(res, 200, { requiresSignIn: false }, 'Verification email sent.');
+  } catch (error) {
+    console.error('Signup request error:', error);
+    return sendError(res, 500, {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred processing your request',
     });
   }
 });
@@ -455,7 +530,7 @@ router.get('/auth/verify-reset-token', async (req, res) => {
 
     const now = new Date();
     const [user] = await db
-      .select({ email: users.email })
+      .select({ email: users.email, passwordHash: users.passwordHash })
       .from(users)
       .where(
         and(
@@ -472,7 +547,15 @@ router.get('/auth/verify-reset-token', async (req, res) => {
       });
     }
 
-    return sendSuccess(res, 200, { valid: true, email: user.email }, 'Reset token is valid.');
+    // Lets the frontend tell a first-time "set your password" (signup / invite
+    // claim) apart from a genuine reset of an existing password, and adjust
+    // its copy and post-submit flow (auto sign-in vs. "go log in") accordingly.
+    return sendSuccess(
+      res,
+      200,
+      { valid: true, email: user.email, hadPassword: !!user.passwordHash },
+      'Reset token is valid.'
+    );
   } catch (error) {
     console.error('Verify reset token error:', error);
     return sendError(res, 500, {

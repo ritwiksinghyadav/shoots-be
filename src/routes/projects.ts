@@ -1,12 +1,28 @@
 import { Router, Response } from 'express';
+import crypto from 'crypto';
 import { eq, and, or, asc, desc, inArray, ne, gte, lte, like, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { projects, shootDays, shootMembers, expenses, users, teamMembers } from '../db/schema.js';
+import { projects, shootDays, shootMembers, expenses, users, teamMembers, shootMilestones } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { sendInvitationEmail } from '../utils/email.js';
 
 const router = Router();
+
+/** A stable, URL-safe opaque token for the public share link. */
+function generateShareToken(): string {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+function shapeMilestone(m: typeof shootMilestones.$inferSelect) {
+  return {
+    id: m.id,
+    stage: m.stage,
+    note: m.note ?? undefined,
+    date: m.date ?? undefined,
+    createdAt: m.createdAt.toISOString(),
+  };
+}
 
 // ─── Shape helpers ──────────────────────────────────────────────────────────
 
@@ -63,7 +79,8 @@ function shapeProject(
     payment: number;
     paymentStatus: string;
     invited: boolean;
-  }[] = []
+  }[] = [],
+  milestones: (typeof shootMilestones.$inferSelect)[] = []
 ) {
   return {
     id: p.id,
@@ -87,6 +104,13 @@ function shapeProject(
       date: e.date ?? undefined,
     })),
     shootDays: days.map(shapeShootDay),
+    productionStage: p.productionStage,
+    milestones: milestones
+      .slice()
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .map(shapeMilestone),
+    shareEnabled: p.shareEnabled,
+    shareToken: p.shareToken ?? null,
   };
 }
 
@@ -96,6 +120,8 @@ function stripProjectForMember(project: ReturnType<typeof shapeProject>, userId:
     ...project,
     budget: 0,
     expenses: [],
+    // Sharing is an owner-only control — crew see the timeline but not the link/token.
+    shareToken: null,
     team: project.team.map((member) => {
       // Keep own payment details, mask other crew members' financial details
       if (member.userId === userId) {
@@ -177,6 +203,98 @@ function shapeTeamMember(t: {
 
 // Apply auth middleware to all project routes
 router.use(requireAuth);
+
+// GET /search?q= — unified search across shoots, crew (circle), and clients.
+// One bundled endpoint (rather than three client-side calls) so the frontend
+// can fetch it as a single Server Action, matching the app's established
+// "one bundled read per page" pattern.
+router.get('/search', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+    if (!q) {
+      return sendSuccess(res, 200, { shoots: [], crew: [], clients: [] }, 'Empty query');
+    }
+    const pattern = `%${q}%`;
+
+    // Shoots the user owns or is a crew member on, matching title or client.
+    const shootRows = await db
+      .select({ project: projects })
+      .from(projects)
+      .leftJoin(shootMembers, and(eq(projects.id, shootMembers.projectId), eq(shootMembers.userId, userId)))
+      .where(
+        and(
+          or(eq(projects.ownerId, userId), eq(shootMembers.userId, userId)),
+          or(
+            like(sql`lower(${projects.title})`, pattern),
+            like(sql`lower(${projects.client})`, pattern)
+          )
+        )
+      )
+      .groupBy(projects.id)
+      .limit(6);
+
+    // Crew — this user's own circle (team_members), matching name or email.
+    const crewRows = await db
+      .select({ id: users.id, name: users.name, email: users.email })
+      .from(teamMembers)
+      .innerJoin(users, eq(teamMembers.memberId, users.id))
+      .where(
+        and(
+          eq(teamMembers.userId, userId),
+          or(
+            like(sql`lower(${users.name})`, pattern),
+            like(sql`lower(${users.email})`, pattern)
+          )
+        )
+      )
+      .limit(6);
+
+    // Clients — distinct client names on accessible projects matching the query.
+    const clientRows = await db
+      .select({ client: projects.client })
+      .from(projects)
+      .leftJoin(shootMembers, and(eq(projects.id, shootMembers.projectId), eq(shootMembers.userId, userId)))
+      .where(
+        and(
+          or(eq(projects.ownerId, userId), eq(shootMembers.userId, userId)),
+          like(sql`lower(${projects.client})`, pattern)
+        )
+      )
+      .groupBy(projects.client)
+      .limit(20);
+
+    const uniqueClients = Array.from(new Set(clientRows.map((r) => r.client))).slice(0, 6);
+
+    return sendSuccess(
+      res,
+      200,
+      {
+        shoots: shootRows.map((r) => ({
+          id: r.project.id,
+          title: r.project.title,
+          client: r.project.client,
+          emoji: r.project.icon ?? '📸',
+          status: r.project.status,
+        })),
+        crew: crewRows.map((r) => ({
+          id: r.id,
+          name: r.name || r.email,
+          email: r.email,
+          initials: getInitials(r.name || r.email),
+          avatarColor: getAvatarColor(r.email),
+        })),
+        clients: uniqueClients,
+      },
+      'Search results fetched successfully'
+    );
+  } catch (error) {
+    console.error('Error performing global search:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to perform search' });
+  }
+});
 
 // GET /projects/upcoming-days — fetch shoot days between today and one month from today
 router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Response) => {
@@ -969,6 +1087,18 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
       membersByProject.get(m.projectId)!.push(m);
     }
 
+    // Fetch all delivery timeline milestones for those projects in one query
+    const allMilestones = await db
+      .select()
+      .from(shootMilestones)
+      .where(inArray(shootMilestones.projectId, projectIds));
+
+    const milestonesByProject = new Map<string, typeof allMilestones>();
+    for (const m of allMilestones) {
+      if (!milestonesByProject.has(m.projectId)) milestonesByProject.set(m.projectId, []);
+      milestonesByProject.get(m.projectId)!.push(m);
+    }
+
     // 4. Shape
     const shaped = rows.map((r) => {
       const isOwner = r.project.ownerId === userId;
@@ -978,7 +1108,8 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
         r.ownerEmail || '',
         daysByProject.get(r.project.id) ?? [],
         expensesByProject.get(r.project.id) ?? [],
-        membersByProject.get(r.project.id) ?? []
+        membersByProject.get(r.project.id) ?? [],
+        milestonesByProject.get(r.project.id) ?? []
       );
 
       if (!isOwner) {
@@ -1068,6 +1199,11 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .leftJoin(users, eq(shootMembers.userId, users.id))
       .where(eq(shootMembers.projectId, id));
 
+    const milestones = await db
+      .select()
+      .from(shootMilestones)
+      .where(eq(shootMilestones.projectId, id));
+
     const isOwner = projectData.project.ownerId === userId;
     let shapedProject = shapeProject(
       projectData.project,
@@ -1075,7 +1211,8 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       projectData.ownerEmail ?? '',
       days,
       exps,
-      members
+      members,
+      milestones
     );
 
     if (!isOwner) {
@@ -1101,7 +1238,7 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     const id = String(req.params.id);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    const { title, client, status, budget, icon, notes } = req.body;
+    const { title, client, status, budget, icon, notes, productionStage } = req.body;
 
     // Validate required fields
     const fields: Record<string, string> = {};
@@ -1111,6 +1248,8 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       fields.client = 'Client cannot be empty';
     if (budget !== undefined && (isNaN(Number(budget)) || Number(budget) < 0))
       fields.budget = 'Budget must be a valid number';
+    if (productionStage !== undefined && (!productionStage || typeof productionStage !== 'string' || !productionStage.trim()))
+      fields.productionStage = 'Stage cannot be empty';
     if (Object.keys(fields).length > 0)
       return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
 
@@ -1123,6 +1262,7 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
         ...(budget !== undefined && { budget: Number(budget) }),
         ...(icon !== undefined && { icon }),
         ...(notes !== undefined && { notes: notes.trim() }),
+        ...(productionStage !== undefined && { productionStage: productionStage.trim() }),
         updatedAt: new Date(),
       })
       .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
@@ -1165,10 +1305,15 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .leftJoin(users, eq(shootMembers.userId, users.id))
       .where(eq(shootMembers.projectId, id));
 
+    const milestones = await db
+      .select()
+      .from(shootMilestones)
+      .where(eq(shootMilestones.projectId, id));
+
     return sendSuccess(
       res,
       200,
-      { project: shapeProject(updatedProject, owner?.name ?? userId, owner?.email ?? '', days, exps, members) },
+      { project: shapeProject(updatedProject, owner?.name ?? userId, owner?.email ?? '', days, exps, members, milestones) },
       'Project updated successfully'
     );
   } catch (error) {
@@ -1385,6 +1530,169 @@ router.delete('/projects/:projectId/expenses/:expenseId', async (req: Authentica
   } catch (error) {
     console.error('Error deleting expense:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete expense' });
+  }
+});
+
+// ─── Delivery Timeline / Milestones ─────────────────────────────────────────
+// Separate from `status` (the inquiry/booked/paid business pipeline) — this
+// tracks what's actually happening with the shoot day-to-day (shooting,
+// editing, delivered), visible to crew today and to clients via the public
+// share page once that's enabled.
+
+// POST /projects/:projectId/milestones
+router.post('/projects/:projectId/milestones', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const { stage, note, date } = req.body;
+
+    const fields: Record<string, string> = {};
+    if (!stage || typeof stage !== 'string' || !stage.trim()) fields.stage = 'Stage is required';
+    if (!date || typeof date !== 'string' || !date.trim()) fields.date = 'Date is required';
+    if (!note || typeof note !== 'string' || !note.trim()) fields.note = 'Note is required';
+    if (Object.keys(fields).length > 0) {
+      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
+    }
+
+    const [newMilestone] = await db.insert(shootMilestones).values({
+      projectId,
+      stage: stage.trim(),
+      note: note.trim(),
+      date: date.trim(),
+    }).returning();
+
+    // Keep the denormalized "current stage" on the project in sync.
+    await db.update(projects)
+      .set({ productionStage: newMilestone.stage, updatedAt: new Date() })
+      .where(eq(projects.id, projectId));
+
+    return sendSuccess(
+      res,
+      201,
+      { milestone: shapeMilestone(newMilestone), productionStage: newMilestone.stage },
+      'Milestone added successfully'
+    );
+  } catch (error) {
+    console.error('Error adding milestone:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to add milestone' });
+  }
+});
+
+// DELETE /projects/:projectId/milestones/:milestoneId
+router.delete('/projects/:projectId/milestones/:milestoneId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const milestoneId = String(req.params.milestoneId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const [deletedMilestone] = await db.delete(shootMilestones)
+      .where(and(eq(shootMilestones.id, milestoneId), eq(shootMilestones.projectId, projectId)))
+      .returning();
+
+    if (!deletedMilestone) {
+      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Milestone not found' });
+    }
+
+    // Recompute the denormalized current stage from what's left, falling
+    // back to 'booked' (the same default a project starts with) if the
+    // timeline is now empty.
+    const [latest] = await db
+      .select()
+      .from(shootMilestones)
+      .where(eq(shootMilestones.projectId, projectId))
+      .orderBy(desc(shootMilestones.createdAt))
+      .limit(1);
+
+    const newStage = latest?.stage ?? 'booked';
+    await db.update(projects)
+      .set({ productionStage: newStage, updatedAt: new Date() })
+      .where(eq(projects.id, projectId));
+
+    return sendSuccess(res, 200, { productionStage: newStage }, 'Milestone deleted successfully');
+  } catch (error) {
+    console.error('Error deleting milestone:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete milestone' });
+  }
+});
+
+// ─── Client-facing sharing ───────────────────────────────────────────────────
+// Owner-only controls for the public, read-only share page at
+// GET /public/shoot/:token (routes/public.ts — no auth, mounted separately).
+
+// POST /projects/:projectId/share — enable sharing, minting a token on first use
+router.post('/projects/:projectId/share', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const token = project.shareToken ?? generateShareToken();
+
+    const [updated] = await db.update(projects)
+      .set({ shareToken: token, shareEnabled: true, updatedAt: new Date() })
+      .where(eq(projects.id, projectId))
+      .returning();
+
+    return sendSuccess(res, 200, { shareToken: updated.shareToken, shareEnabled: updated.shareEnabled }, 'Sharing enabled');
+  } catch (error) {
+    console.error('Error enabling sharing:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to enable sharing' });
+  }
+});
+
+// DELETE /projects/:projectId/share — disable sharing (token kept so re-enabling doesn't change the link)
+router.delete('/projects/:projectId/share', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    await db.update(projects)
+      .set({ shareEnabled: false, updatedAt: new Date() })
+      .where(eq(projects.id, projectId));
+
+    return sendSuccess(res, 200, { shareEnabled: false }, 'Sharing disabled');
+  } catch (error) {
+    console.error('Error disabling sharing:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to disable sharing' });
+  }
+});
+
+// POST /projects/:projectId/share/reset — revoke the old link and mint a new token
+router.post('/projects/:projectId/share/reset', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const token = generateShareToken();
+    const [updated] = await db.update(projects)
+      .set({ shareToken: token, updatedAt: new Date() })
+      .where(eq(projects.id, projectId))
+      .returning();
+
+    return sendSuccess(res, 200, { shareToken: updated.shareToken, shareEnabled: updated.shareEnabled }, 'Share link reset');
+  } catch (error) {
+    console.error('Error resetting share link:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to reset share link' });
   }
 });
 

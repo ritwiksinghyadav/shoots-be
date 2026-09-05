@@ -51,11 +51,44 @@ export const projects = pgTable('projects', {
   budget: integer('budget').notNull().default(0),
   icon: text('icon'),
   notes: text('notes'),
+  /**
+   * Denormalized "current stage" of production/delivery (e.g. 'booked',
+   * 'shooting', 'editing', 'delivered') — free text, same convention as
+   * `status`. Kept in sync with the latest row in `shoot_milestones` so list
+   * views can show a badge without joining/aggregating per project. This is
+   * deliberately a separate concept from `status`: `status` is the
+   * inquiry/booked/paid business pipeline, this is what's actually happening
+   * with the shoot day-to-day — the two can and will diverge (a shoot can be
+   * `booked` and simultaneously "in editing").
+   */
+  productionStage: text('production_stage').notNull().default('booked'),
+  /**
+   * Random opaque token for the read-only public share page
+   * (`/s/:shareToken`). Null until the owner enables sharing for the first
+   * time; kept (not cleared) when sharing is disabled via `shareEnabled` so
+   * re-enabling doesn't mint a new link. Unique so it can double as the
+   * lookup key for the public route.
+   */
+  shareToken: text('share_token').unique(),
+  shareEnabled: boolean('share_enabled').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: updatedAt(),
 }, (table) => [
   index('projects_title_trgm_idx').using('gin', sql`lower(${table.title}) gin_trgm_ops`),
   index('projects_client_trgm_idx').using('gin', sql`lower(${table.client}) gin_trgm_ops`),
+]);
+
+export const shootMilestones = pgTable('shoot_milestones', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+  /** Free text, same convention as `projects.status`/`productionStage` — a fixed set is offered in the UI but not enforced here. */
+  stage: text('stage').notNull(),
+  note: text('note'),
+  /** Optional YYYY-MM-DD the milestone happened/is expected — distinct from `createdAt`, which is when the log entry was made. */
+  date: text('date'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('shoot_milestones_project_idx').on(table.projectId),
 ]);
 
 export const shootDays = pgTable('shoot_days', {
