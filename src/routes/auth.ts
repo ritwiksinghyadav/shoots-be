@@ -581,13 +581,11 @@ router.post('/auth/forgot-password', async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    // The response below is intentionally identical whether or not an
-    // account exists for this email. Returning a distinct 404 (or a
-    // distinct error when the send fails) would let anyone probe arbitrary
-    // addresses to learn which ones have accounts on the platform.
-    const genericResponse = () =>
-      sendSuccess(res, 200, {}, 'If an account exists for this email, a password reset link has been sent.');
-
+    // NOTE: deliberately reveals whether an account exists for this email —
+    // requested explicitly, aware this trades away the standard anti-
+    // enumeration protection (a generic response regardless of match) that
+    // this endpoint used to have. Anyone can now probe arbitrary addresses
+    // here to learn which ones have accounts on the platform.
     const [user] = await db
       .select()
       .from(users)
@@ -595,7 +593,11 @@ router.post('/auth/forgot-password', async (req, res) => {
       .limit(1);
 
     if (!user) {
-      return genericResponse();
+      return sendError(res, 404, {
+        code: 'NOT_FOUND',
+        message: 'No account found with this email address.',
+        fields: { email: 'No account found with this email address.' },
+      });
     }
 
     // Create one-time use token
@@ -618,13 +620,10 @@ router.post('/auth/forgot-password', async (req, res) => {
 
     const emailSent = await sendPasswordResetEmail(cleanEmail, resetLink);
     if (!emailSent) {
-      // Log for ops visibility only — the caller still gets the generic
-      // response so a send failure can't be used to distinguish real
-      // accounts from nonexistent ones.
       console.error(`Forgot password: failed to send reset email to ${cleanEmail}`);
     }
 
-    return genericResponse();
+    return sendSuccess(res, 200, {}, 'A password reset link has been sent to your email.');
   } catch (error) {
     console.error('Forgot password error:', error);
     return sendError(res, 500, {
