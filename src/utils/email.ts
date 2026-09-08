@@ -54,8 +54,8 @@ export async function sendInvitationEmail(
   const projectUrl = `${FRONTEND_URL}/login?callbackUrl=${encodeURIComponent(`/shoots/${projectId}`)}`;
 
   const introParagraph = needsPasswordSetup
-    ? `You have been added to a photography project by <strong>${ownerName}</strong>. Since this is your first time on SHOOTS, you'll need to set a password before you can sign in. Here are the project details:`
-    : `You have been added to a photography project by <strong>${ownerName}</strong>. Here are the details of the project:`;
+    ? `You have been added to a project by <strong>${ownerName}</strong>. Since this is your first time on SHOOTS, you'll need to set a password before you can sign in. Here are the project details:`
+    : `You have been added to a project by <strong>${ownerName}</strong>. Here are the details of the project:`;
 
   const ctaSection = needsPasswordSetup
     ? `

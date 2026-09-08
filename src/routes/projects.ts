@@ -1919,21 +1919,44 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
     let bookings: Array<{ userId: string | null; date: string; projectTitle: string }> = [];
 
     if (memberIds.length > 0 && targetDates.length > 0) {
-      bookings = await db
-        .select({
-          userId: shootMembers.userId,
-          date: shootDays.date,
-          projectTitle: projects.title,
-        })
-        .from(shootMembers)
-        .innerJoin(projects, eq(shootMembers.projectId, projects.id))
-        .innerJoin(shootDays, eq(shootDays.projectId, projects.id))
-        .where(
-          and(
-            inArray(shootMembers.userId, memberIds),
-            inArray(shootDays.date, targetDates)
-          )
-        );
+      // A circle member can be "busy" two different ways: booked as crew on
+      // someone else's project (shootMembers), or running their own project
+      // as the owner (projects.ownerId) — e.g. a shoot they booked directly
+      // with a client, with no shootMembers row at all. Availability has to
+      // check both, or a member's own bookings are invisible to everyone
+      // else's Circle.
+      const [crewBookings, ownedBookings] = await Promise.all([
+        db
+          .select({
+            userId: shootMembers.userId,
+            date: shootDays.date,
+            projectTitle: projects.title,
+          })
+          .from(shootMembers)
+          .innerJoin(projects, eq(shootMembers.projectId, projects.id))
+          .innerJoin(shootDays, eq(shootDays.projectId, projects.id))
+          .where(
+            and(
+              inArray(shootMembers.userId, memberIds),
+              inArray(shootDays.date, targetDates)
+            )
+          ),
+        db
+          .select({
+            userId: projects.ownerId,
+            date: shootDays.date,
+            projectTitle: projects.title,
+          })
+          .from(projects)
+          .innerJoin(shootDays, eq(shootDays.projectId, projects.id))
+          .where(
+            and(
+              inArray(projects.ownerId, memberIds),
+              inArray(shootDays.date, targetDates)
+            )
+          ),
+      ]);
+      bookings = [...crewBookings, ...ownedBookings];
     }
 
     const result = rows.map((r) => {
