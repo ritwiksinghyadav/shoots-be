@@ -489,8 +489,11 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
     // 1. Fetch owned projects summary: budget, project month, and crew payouts
+    // Excludes 'inquiry' projects — an inquiry is an unconfirmed lead (see the
+    // "Still in Inquiry — needs confirming" dashboard messaging), not real
+    // revenue, so it shouldn't inflate Net Earnings until it's booked/paid.
     const ownedProjectsQuery = await db.execute(sql`
-      SELECT 
+      SELECT
         p.id,
         p.budget,
         COALESCE(
@@ -502,12 +505,14 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
           0
         )::integer AS crew_payouts
       FROM projects p
-      WHERE p.owner_id = ${userId}::uuid
+      WHERE p.owner_id = ${userId}::uuid AND p.status != 'inquiry'
     `);
 
-    // 2. Fetch expenses grouped by month for owned projects
+    // 2. Fetch expenses grouped by month for owned projects (same inquiry
+    // exclusion, so a costed-but-unconfirmed lead doesn't drag down profit
+    // for revenue it was also excluded from)
     const expensesQuery = await db.execute(sql`
-      SELECT 
+      SELECT
         COALESCE(
           LEFT(e.date, 7),
           TO_CHAR(e.created_at, 'YYYY-MM')
@@ -515,13 +520,15 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
         SUM(e.amount)::integer AS total_amount
       FROM expenses e
       JOIN projects p ON e.project_id = p.id
-      WHERE p.owner_id = ${userId}::uuid
+      WHERE p.owner_id = ${userId}::uuid AND p.status != 'inquiry'
       GROUP BY expense_month
     `);
 
     // 3. Fetch member projects: payment earnings grouped by project month
+    // (same inquiry exclusion — a payment on a project you're crew on that's
+    // still just an inquiry isn't earned yet either)
     const memberProjectsQuery = await db.execute(sql`
-      SELECT 
+      SELECT
         COALESCE(
           (SELECT LEFT(MIN(sd.date), 7) FROM shoot_days sd WHERE sd.project_id = p.id),
           TO_CHAR(p.created_at, 'YYYY-MM')
@@ -529,7 +536,7 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
         SUM(sm.payment)::integer AS total_payment
       FROM shoot_members sm
       JOIN projects p ON sm.project_id = p.id
-      WHERE sm.user_id = ${userId}::uuid
+      WHERE sm.user_id = ${userId}::uuid AND p.status != 'inquiry'
       GROUP BY project_month
     `);
 
