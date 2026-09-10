@@ -29,7 +29,7 @@ type UserRow = typeof users.$inferSelect;
  * This is the inverse of the naive 1=true/0=false reading — get it backwards
  * and every brand-new account reports as already onboarded.
  */
-function serializeUser(user: UserRow) {
+export function serializeUser(user: UserRow) {
   const { passwordHash: _passwordHash, firstLogin, ...rest } = user;
   return { ...rest, firstLogin: firstLogin === 0 };
 }

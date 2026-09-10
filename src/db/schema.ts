@@ -29,9 +29,13 @@ export const users = pgTable('users', {
    */
   occupation: text('occupation'),
   preferredCurrency: text('preferred_currency').notNull().default('USD'),
+  /** Free text, same convention as `projects.status`/`feedback.type` — 'user' | 'admin' today. */
+  role: text('role').notNull().default('user'),
   invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
   firstLogin: smallint('first_login').default(1).notNull(),
   isVerified: boolean('is_verified').default(false).notNull(),
+  /** Membership tier, admin-controlled — no self-serve or payment flow behind this yet. */
+  isPro: boolean('is_pro').default(false).notNull(),
   resetToken: text('reset_token'),
   resetTokenExpiry: timestamp('reset_token_expiry', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
