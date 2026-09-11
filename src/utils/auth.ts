@@ -14,6 +14,12 @@ export async function comparePassword(password: string, hash: string): Promise<b
 export interface JWTPayload {
   userId: string;
   email: string;
+  /**
+   * Refresh tokens only: the refresh_sessions row this token belongs to, so the
+   * session can be revoked server-side. Absent on access tokens, and on refresh
+   * tokens issued before per-session revocation existed (see POST /auth/refresh).
+   */
+  jti?: string;
 }
 
 export function generateAccessToken(payload: JWTPayload): string {

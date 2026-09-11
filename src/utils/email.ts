@@ -8,6 +8,16 @@ const SENDER_EMAIL = process.env.SENDER_EMAIL || 'ritwikfullstack@gmail.com';
 const SENDER_NAME = process.env.SENDER_NAME || 'SHOOTS';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3005';
 
+/** Escape user-controlled strings before interpolating into email HTML (project title/client/name are free text). */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function formatDisplayDate(dateStr: string): string {
   try {
     const parts = dateStr.split('-');
@@ -44,6 +54,16 @@ export async function sendInvitationEmail(
     ? sortedDates.map(d => formatDisplayDate(d)).join(', ')
     : 'TBD';
 
+  // These are all free-text fields set by the inviting user (project title/client/
+  // their own name) or the invited email address itself — escape before interpolating
+  // into HTML so an attacker can't use them to inject markup/links into an email SHOOTS
+  // sends, on their behalf, to a third party who never signed up.
+  const safeOwnerName = escapeHtml(ownerName);
+  const safeProjectName = escapeHtml(projectName);
+  const safeClientName = escapeHtml(clientName);
+  const safeToEmail = escapeHtml(toEmail);
+  const safeFormattedDates = escapeHtml(formattedDates);
+
   const client = new BrevoClient({ apiKey: BREVO_API_KEY });
 
   // First-time / no-password-yet invitees can't sign in directly — point them
@@ -54,12 +74,12 @@ export async function sendInvitationEmail(
   const projectUrl = `${FRONTEND_URL}/login?callbackUrl=${encodeURIComponent(`/shoots/${projectId}`)}`;
 
   const introParagraph = needsPasswordSetup
-    ? `You have been added to a project by <strong>${ownerName}</strong>. Since this is your first time on SHOOTS, you'll need to set a password before you can sign in. Here are the project details:`
-    : `You have been added to a project by <strong>${ownerName}</strong>. Here are the details of the project:`;
+    ? `You have been added to a project by <strong>${safeOwnerName}</strong>. Since this is your first time on SHOOTS, you'll need to set a password before you can sign in. Here are the project details:`
+    : `You have been added to a project by <strong>${safeOwnerName}</strong>. Here are the details of the project:`;
 
   const ctaSection = needsPasswordSetup
     ? `
-        <p>Click below to go to the <strong>Forgot Password</strong> page and enter your email (<strong>${toEmail}</strong>) — we'll send you a one-time link to set your password and sign in.</p>
+        <p>Click below to go to the <strong>Forgot Password</strong> page and enter your email (<strong>${safeToEmail}</strong>) — we'll send you a one-time link to set your password and sign in.</p>
         <div class="btn-container">
           <a href="${forgotPasswordUrl}" class="btn">Set Your Password</a>
         </div>
@@ -178,15 +198,15 @@ export async function sendInvitationEmail(
         <div class="details-card">
           <div class="details-row">
             <span class="details-label">Project</span>
-            <span class="details-value">${projectName}</span>
+            <span class="details-value">${safeProjectName}</span>
           </div>
           <div class="details-row">
             <span class="details-label">Client</span>
-            <span class="details-value">${clientName}</span>
+            <span class="details-value">${safeClientName}</span>
           </div>
           <div class="details-row">
             <span class="details-label">Date(s)</span>
-            <span class="details-value">${formattedDates}</span>
+            <span class="details-value">${safeFormattedDates}</span>
           </div>
         </div>
 

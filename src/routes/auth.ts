@@ -1,8 +1,8 @@
 import { Router, Response } from 'express';
-import { eq, and, gt } from 'drizzle-orm';
+import { eq, and, gt, isNull } from 'drizzle-orm';
 import crypto from 'crypto';
 import { db } from '../db/index.js';
-import { users } from '../db/schema.js';
+import { users, refreshSessions } from '../db/schema.js';
 import {
   hashPassword,
   comparePassword,
@@ -32,6 +32,34 @@ type UserRow = typeof users.$inferSelect;
 export function serializeUser(user: UserRow) {
   const { passwordHash: _passwordHash, firstLogin, ...rest } = user;
   return { ...rest, firstLogin: firstLogin === 0 };
+}
+
+const REFRESH_TOKEN_TTL_MS = 60 * 24 * 60 * 60 * 1000; // 60 days — matches generateRefreshToken
+
+/**
+ * Opens a new signed-in session for a user and returns the token pair for it.
+ * The session row's id rides along as the refresh token's `jti`, which is what
+ * makes that one session revocable without touching the user's other devices.
+ */
+async function issueSessionTokens(user: Pick<UserRow, 'id' | 'email'>) {
+  const [session] = await db
+    .insert(refreshSessions)
+    .values({ userId: user.id, expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS) })
+    .returning({ id: refreshSessions.id });
+
+  const tokenPayload = { userId: user.id, email: user.email, jti: session.id };
+  return {
+    accessToken: generateAccessToken({ userId: user.id, email: user.email }),
+    refreshToken: generateRefreshToken(tokenPayload),
+  };
+}
+
+/** Revokes every active session for a user — used when the password changes. */
+async function revokeAllSessions(userId: string) {
+  await db
+    .update(refreshSessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(refreshSessions.userId, userId), isNull(refreshSessions.revokedAt)));
 }
 
 // Helper to set refresh token cookie
@@ -106,9 +134,7 @@ router.post('/auth/register', async (req, res) => {
       .returning();
 
     // 5. Generate tokens
-    const tokenPayload = { userId: newUser.id, email: newUser.email };
-    const accessToken = generateAccessToken(tokenPayload);
-    const refreshToken = generateRefreshToken(tokenPayload);
+    const { accessToken, refreshToken } = await issueSessionTokens(newUser);
 
     // 6. Set cookie & return response
     setRefreshTokenCookie(res, refreshToken);
@@ -259,9 +285,7 @@ router.post('/auth/login', async (req, res) => {
     }
 
     // 4. Generate tokens
-    const tokenPayload = { userId: user.id, email: user.email };
-    const accessToken = generateAccessToken(tokenPayload);
-    const refreshToken = generateRefreshToken(tokenPayload);
+    const { accessToken, refreshToken } = await issueSessionTokens(user);
 
     // 5. Set cookie & return response
     setRefreshTokenCookie(res, refreshToken);
@@ -321,10 +345,38 @@ router.post('/auth/refresh', async (req, res) => {
       });
     }
 
-    // 3. Rotate tokens (generate new access and refresh tokens)
-    const tokenPayload = { userId: user.id, email: user.email };
-    const newAccessToken = generateAccessToken(tokenPayload);
-    const newRefreshToken = generateRefreshToken(tokenPayload);
+    // 3. Check the session behind this token is still alive. Tokens minted before
+    //    per-session revocation existed carry no `jti`; rather than force-logging
+    //    those users out, adopt them into a fresh session on this refresh. Every
+    //    such token expires by itself 60 days after that change shipped, after
+    //    which this branch can be deleted and a missing jti simply rejected.
+    if (!payload.jti) {
+      const { accessToken, refreshToken: upgradedToken } = await issueSessionTokens(user);
+      setRefreshTokenCookie(res, upgradedToken);
+      return sendSuccess(res, 200, {
+        accessToken,
+        refreshToken: upgradedToken,
+      }, 'Token refreshed successfully');
+    }
+
+    const [session] = await db
+      .select()
+      .from(refreshSessions)
+      .where(and(eq(refreshSessions.id, payload.jti), eq(refreshSessions.userId, user.id)))
+      .limit(1);
+
+    if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now()) {
+      return sendError(res, 401, {
+        code: 'UNAUTHORIZED',
+        message: 'Refresh token has been revoked',
+      });
+    }
+
+    // 4. Rotate the token string, keeping the same session. Reusing the jti means
+    //    two concurrent refreshes from one session both stay valid instead of one
+    //    invalidating the other and bouncing the user to the login screen.
+    const newAccessToken = generateAccessToken({ userId: user.id, email: user.email });
+    const newRefreshToken = generateRefreshToken({ userId: user.id, email: user.email, jti: session.id });
 
     setRefreshTokenCookie(res, newRefreshToken);
 
@@ -342,13 +394,36 @@ router.post('/auth/refresh', async (req, res) => {
 });
 
 // POST /auth/logout
-router.post('/auth/logout', (req, res) => {
+router.post('/auth/logout', async (req, res) => {
   const isProd = process.env.NODE_ENV === 'production';
   res.clearCookie('refreshToken', {
     httpOnly: true,
     secure: isProd,
     sameSite: isProd ? 'none' : 'lax',
   });
+
+  // Best-effort: revoke just this device's session server-side, so its refresh
+  // token stops working instead of staying valid for its full 60-day lifetime.
+  // The user's other devices keep their own sessions. Never block the logout
+  // response on this — an invalid/missing cookie just means nothing to revoke.
+  const refreshToken =
+    req.cookies?.refreshToken ||
+    req.body?.refreshToken ||
+    (req.headers['x-refresh-token'] as string);
+  if (refreshToken) {
+    try {
+      const payload = verifyRefreshToken(refreshToken);
+      if (payload.jti) {
+        await db
+          .update(refreshSessions)
+          .set({ revokedAt: new Date() })
+          .where(and(eq(refreshSessions.id, payload.jti), eq(refreshSessions.userId, payload.userId)));
+      }
+    } catch {
+      // Invalid/expired token — nothing to revoke, logout still succeeds.
+    }
+  }
+
   return sendSuccess(res, 200, {}, 'Logged out successfully');
 });
 
@@ -502,6 +577,13 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
         code: 'NOT_FOUND',
         message: 'User not found',
       });
+    }
+
+    // A password change signs out every device, including this one — otherwise a
+    // session hijacked before the change keeps working. The settings page signs
+    // the user out itself so this isn't a surprise mid-session.
+    if (updatePayload.passwordHash) {
+      await revokeAllSessions(userId);
     }
 
     return sendSuccess(res, 200, {
@@ -690,6 +772,10 @@ router.post('/auth/reset-password', async (req, res) => {
         resetTokenExpiry: null,
       })
       .where(eq(users.id, user.id));
+
+    // Whoever reset the password now owns the account — drop every session that
+    // existed beforehand, since this is the flow used to recover a compromised one.
+    await revokeAllSessions(user.id);
 
     return sendSuccess(res, 200, {}, 'Password reset successfully.');
   } catch (error) {

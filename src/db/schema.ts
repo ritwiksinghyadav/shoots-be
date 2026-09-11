@@ -42,6 +42,27 @@ export const users = pgTable('users', {
   updatedAt: updatedAt(),
 });
 
+/**
+ * One row per signed-in device/session. The row's `id` is carried in the refresh
+ * token's `jti` claim, which is what makes refresh tokens revocable per-device:
+ * logging out on a phone revokes only that row, leaving the laptop signed in.
+ * Password change/reset revokes every row for the user instead.
+ *
+ * A row survives token rotation — POST /auth/refresh reissues a new token string
+ * carrying the same `jti`, so concurrent refreshes from the same session both stay
+ * valid rather than racing each other into a spurious logout.
+ */
+export const refreshSessions = pgTable('refresh_sessions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  /** Mirrors the refresh token's own 60-day expiry, so expired rows can be pruned. */
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('refresh_sessions_user_id_idx').on(table.userId),
+]);
+
 
 export const projects = pgTable('projects', {
   id: uuid('id').defaultRandom().primaryKey(),

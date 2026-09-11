@@ -114,6 +114,24 @@ function shapeProject(
   };
 }
 
+/**
+ * Mask budget and other members' payment info for a non-owner viewer.
+ * Same invariant as stripProjectForMember(), for call sites that build a
+ * lighter-weight shoot shape (calendar/upcoming-days) instead of the full
+ * shapeProject() output.
+ */
+function maskFinancialsForViewer<
+  T extends { userId: string | null; payment: number; paymentStatus: 'paid' | 'unpaid' }
+>(isOwner: boolean, userId: string, budget: number, team: T[]): { budget: number; team: T[] } {
+  if (isOwner) return { budget, team };
+  return {
+    budget: 0,
+    team: team.map((member) =>
+      member.userId === userId ? member : { ...member, payment: 0, paymentStatus: 'unpaid' as const }
+    ),
+  };
+}
+
 /** Strip confidential financial and expense details from a project for a crew member */
 function stripProjectForMember(project: ReturnType<typeof shapeProject>, userId: string) {
   return {
@@ -361,6 +379,13 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
     const result = rows.map((row) => {
       const shapedDay = shapeShootDay(row.shootDay);
       const projectMembers = membersByProject.get(row.project.id) ?? [];
+      const isOwner = row.project.ownerId === userId;
+      const { budget, team } = maskFinancialsForViewer(
+        isOwner,
+        userId,
+        row.project.budget,
+        projectMembers.map(shapeTeamMember)
+      );
       return {
         shoot: {
           id: row.project.id,
@@ -369,12 +394,12 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
           title: row.project.title,
           client: row.project.client,
           status: row.project.status,
-          budget: row.project.budget,
+          budget,
           emoji: row.project.icon ?? '📸',
           notes: row.project.notes ?? '',
           category: 'editorial',
           coverColor: '#7C3AED',
-          team: projectMembers.map(shapeTeamMember),
+          team,
           expenses: [],
           shootDays: [shapedDay],
         },
@@ -454,6 +479,13 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
     const result = rows.map((row) => {
       const shapedDay = shapeShootDay(row.shootDay);
       const projectMembers = membersByProject.get(row.project.id) ?? [];
+      const isOwner = row.project.ownerId === userId;
+      const { budget, team } = maskFinancialsForViewer(
+        isOwner,
+        userId,
+        row.project.budget,
+        projectMembers.map(shapeTeamMember)
+      );
       return {
         shoot: {
           id: row.project.id,
@@ -462,12 +494,12 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
           title: row.project.title,
           client: row.project.client,
           status: row.project.status,
-          budget: row.project.budget,
+          budget,
           emoji: row.project.icon ?? '📸',
           notes: row.project.notes ?? '',
           category: 'editorial',
           coverColor: '#7C3AED',
-          team: projectMembers.map(shapeTeamMember),
+          team,
           expenses: [],
           shootDays: [shapedDay],
         },
@@ -772,7 +804,9 @@ router.get('/projects/earnings-history', async (req: AuthenticatedRequest, res: 
         status: row.project.status,
         role: 'crew',
         lastShootDate: lastDayByProject[row.project.id] || null,
-        budget: row.project.budget,
+        // Crew never see the owner's real project budget — same invariant as
+        // stripProjectForMember(); myEarning below is their own pay, which is fine.
+        budget: 0,
         expenses: 0,
         crewPayouts: 0,
         myEarning: row.payment,
