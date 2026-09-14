@@ -28,7 +28,7 @@ export const users = pgTable('users', {
    * onboarding/profile forms and validated server-side in `PUT /auth/me`.
    */
   occupation: text('occupation'),
-  preferredCurrency: text('preferred_currency').notNull().default('USD'),
+  preferredCurrency: text('preferred_currency').notNull().default('INR'),
   /** Free text, same convention as `projects.status`/`feedback.type` — 'user' | 'admin' today. */
   role: text('role').notNull().default('user'),
   invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
