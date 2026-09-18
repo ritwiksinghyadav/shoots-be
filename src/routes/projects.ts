@@ -6,6 +6,14 @@ import { projects, shootDays, shootMembers, expenses, users, teamMembers, shootM
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { sendInvitationEmail } from '../utils/email.js';
+import {
+  isProUser,
+  countOwnedProjects,
+  sendProRequired,
+  freeAnalyticsCutoffMonth,
+  FREE_SHOOT_LIMIT,
+  FREE_ANALYTICS_MONTHS,
+} from '../utils/plan.js';
 
 const router = Router();
 
@@ -657,9 +665,19 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       };
     });
 
+    // Free sees a rolling 12-month window; Pro sees all time. Trimmed here
+    // rather than client-side so the full history never leaves the server.
+    const pro = await isProUser(userId);
+    const cutoff = pro ? null : freeAnalyticsCutoffMonth();
+    const timeSeries = Object.entries(monthlyData)
+      .filter(([month]) => !cutoff || month >= cutoff)
+      .map(([month, data]) => ({ month, ...data }));
+
     return sendSuccess(res, 200, {
-      timeSeries: Object.entries(monthlyData).map(([month, data]) => ({ month, ...data })),
+      timeSeries,
       crewPayouts: crewPayoutsList,
+      plan: pro ? 'pro' : 'free',
+      analyticsWindowMonths: pro ? null : FREE_ANALYTICS_MONTHS,
     }, 'Analytics data compiled successfully');
   } catch (error) {
     console.error('Error generating analytics:', error);
@@ -672,6 +690,10 @@ router.get('/projects/earnings-history', async (req: AuthenticatedRequest, res: 
   try {
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    if (!(await isProUser(userId))) {
+      return sendProRequired(res, 'Full earnings history is a Pro feature.');
+    }
 
     const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
     const limit = 50;
@@ -873,6 +895,19 @@ router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
 
     if (Object.keys(fields).length > 0) {
       return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
+    }
+
+    // ── Plan gate ─────────────────────────────────────────────────────────
+    // A cap on creation: every shoot the account has ever made counts, in any
+    // status. Deleting one frees a slot; marking it paid does not.
+    if (!(await isProUser(userId))) {
+      const owned = await countOwnedProjects(userId);
+      if (owned >= FREE_SHOOT_LIMIT) {
+        return sendProRequired(
+          res,
+          `Free covers ${FREE_SHOOT_LIMIT} shoots. Upgrade to Pro to create unlimited shoots.`
+        );
+      }
     }
 
     // ── Insert project ────────────────────────────────────────────────────
@@ -1586,6 +1621,10 @@ router.post('/projects/:projectId/milestones', async (req: AuthenticatedRequest,
     const userId = req.user?.userId;
     const projectId = String(req.params.projectId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    if (!(await isProUser(userId))) {
+      return sendProRequired(res, 'The client delivery timeline is a Pro feature.');
+    }
 
     const project = await requireProjectOwner(projectId, userId, res);
     if (!project) return;

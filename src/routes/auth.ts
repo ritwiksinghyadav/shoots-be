@@ -12,6 +12,7 @@ import {
 } from '../utils/auth.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
+import { countOwnedProjects, FREE_SHOOT_LIMIT } from '../utils/plan.js';
 import { sendPasswordResetEmail, sendSignupVerificationEmail } from '../utils/email.js';
 
 const router = Router();
@@ -451,8 +452,17 @@ router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
     }
 
+    // Shoot allowance travels with the profile so the app can show "2 left"
+    // anywhere without a second round trip or an unreliable client-side count
+    // (the shoots list is filtered/paginated, so counting it there undercounts).
+    const shootsUsed = await countOwnedProjects(userId);
+
     return sendSuccess(res, 200, {
-      user: serializeUser(user),
+      user: {
+        ...serializeUser(user),
+        shootsUsed,
+        shootLimit: user.isPro ? null : FREE_SHOOT_LIMIT,
+      },
     }, 'User profile fetched successfully');
   } catch (error) {
     console.error('Get profile error:', error);
