@@ -3,4 +3,16 @@ updates:
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    # One grouped PR a month instead of a stream of individual ones.
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Major bumps are breaking by definition and are better done deliberately.
+    # Security fixes are unaffected — those come from Dependabot security
+    # updates, which are a separate repo setting and still apply here.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
