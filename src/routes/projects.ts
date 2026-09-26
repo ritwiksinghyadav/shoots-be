@@ -580,9 +580,12 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       GROUP BY project_month
     `);
 
-    // 4. Fetch crew payouts: aggregated by crew member email
+    // 4. Fetch crew payouts: aggregated per crew member (users.email is
+    // unique, so grouping by user id is the same as grouping by email). The
+    // user id lets the frontend link to /circle/[userId] instead of by email.
     const crewPayoutsQuery = await db.execute(sql`
       SELECT 
+        u.id AS user_id,
         LOWER(u.email) AS email,
         MAX(u.name) AS name,
         SUM(CASE WHEN sm.payment_status = 'paid' THEN sm.payment ELSE 0 END)::integer AS total_paid,
@@ -591,14 +594,14 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       JOIN projects p ON sm.project_id = p.id
       JOIN users u ON sm.user_id = u.id
       WHERE p.owner_id = ${userId}::uuid
-      GROUP BY LOWER(u.email)
+      GROUP BY u.id, LOWER(u.email)
     `);
 
     // 5. Type definitions for raw SQL query results
     interface OwnedProjectRow { project_month: string; budget: number; crew_payouts: number }
     interface ExpenseRow { expense_month: string; total_amount: number }
     interface MemberProjectRow { project_month: string; total_payment: number }
-    interface CrewPayoutRow { email: string; name: string; total_paid: number; total_unpaid: number }
+    interface CrewPayoutRow { user_id: string; email: string; name: string; total_paid: number; total_unpaid: number }
 
     // 6. Aggregate monthly financials
     const monthlyData: Record<string, { revenue: number; expenses: number; crewPayouts: number; profit: number; ownedProfit: number; memberEarnings: number }> = {};
@@ -656,6 +659,7 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       const avatarColor = getAvatarColor(email);
 
       return {
+        userId: row.user_id,
         name,
         email,
         initials,
