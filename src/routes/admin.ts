@@ -1,12 +1,13 @@
 import { Router, Response } from 'express';
-import { eq, and, or, desc, like, sql, ne, count } from 'drizzle-orm';
+import { eq, and, or, desc, like, sql, ne, count, gte } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { users, projects, shootDays, shootMembers, expenses, feedback } from '../db/schema.js';
+import { users, projects, shootDays, shootMembers, expenses, feedback, appSettings } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { requireAdmin } from '../middleware/admin.js';
 import { hashPassword } from '../utils/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { serializeUser } from './auth.js';
+import { EARLY_ACCESS_KEY, getEarlyAccessEnd, clearEarlyAccessCache, isEarlyAccessPro } from '../utils/plan.js';
 
 const router = Router();
 
@@ -37,22 +38,29 @@ router.get('/admin/users', async (req: AuthenticatedRequest, res: Response) => {
     }
     const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-    const [countResult] = await db.select({ count: count() }).from(users).where(where);
+    const [[countResult], rows, earlyAccessEnd] = await Promise.all([
+      db.select({ count: count() }).from(users).where(where),
+      db
+        .select()
+        .from(users)
+        .where(where)
+        .orderBy(desc(users.createdAt))
+        .limit(limit)
+        .offset(offset),
+      getEarlyAccessEnd(),
+    ]);
     const total = Number(countResult?.count ?? 0);
     const pages = Math.ceil(total / limit) || 1;
 
-    const rows = await db
-      .select()
-      .from(users)
-      .where(where)
-      .orderBy(desc(users.createdAt))
-      .limit(limit)
-      .offset(offset);
+    const items = rows.map((u) => ({
+      ...serializeUser(u),
+      earlyAccessPro: isEarlyAccessPro(u, earlyAccessEnd),
+    }));
 
     return sendSuccess(
       res,
       200,
-      { items: rows.map(serializeUser), pagination: { total, page, limit, pages } },
+      { items, pagination: { total, page, limit, pages } },
       'Users fetched successfully'
     );
   } catch (error) {
@@ -112,16 +120,17 @@ router.get('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
     const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
     if (!user) return sendError(res, 404, { code: 'NOT_FOUND', message: 'User not found' });
 
-    const [[shootsOwned], [feedbackCount]] = await Promise.all([
+    const [[shootsOwned], [feedbackCount], earlyAccessEnd] = await Promise.all([
       db.select({ count: count() }).from(projects).where(eq(projects.ownerId, id)),
       db.select({ count: count() }).from(feedback).where(eq(feedback.userId, id)),
+      getEarlyAccessEnd(),
     ]);
 
     return sendSuccess(
       res,
       200,
       {
-        user: serializeUser(user),
+        user: { ...serializeUser(user), earlyAccessPro: isEarlyAccessPro(user, earlyAccessEnd) },
         counts: {
           shootsOwned: Number(shootsOwned?.count ?? 0),
           feedbackSubmitted: Number(feedbackCount?.count ?? 0),
@@ -530,6 +539,70 @@ router.delete('/admin/feedback/:id', async (req: AuthenticatedRequest, res: Resp
   } catch (error) {
     console.error('Error deleting admin feedback:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to delete feedback' });
+  }
+});
+
+// ─── Settings ───────────────────────────────────────────────────────────────
+
+/**
+ * Early access state plus who it affects: accounts created on or after the
+ * end date without an admin-granted Pro flag are the ones on Free.
+ */
+async function earlyAccessState() {
+  const endsAt = await getEarlyAccessEnd();
+  let freeAccounts = 0;
+  if (endsAt) {
+    const [row] = await db
+      .select({ total: count() })
+      .from(users)
+      .where(and(eq(users.isPro, false), gte(users.createdAt, endsAt)));
+    freeAccounts = Number(row?.total ?? 0);
+  }
+  return {
+    endsAt: endsAt?.toISOString() ?? null,
+    open: !endsAt || new Date() < endsAt,
+    freeAccounts,
+  };
+}
+
+// GET /admin/settings/early-access
+router.get('/admin/settings/early-access', async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    return sendSuccess(res, 200, await earlyAccessState(), 'Early access settings fetched successfully');
+  } catch (error) {
+    console.error('Admin get early access error:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch early access settings' });
+  }
+});
+
+// PUT /admin/settings/early-access — { endsAt: ISO string | null }. null
+// reopens early access, which makes every account Pro again.
+router.put('/admin/settings/early-access', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { endsAt } = req.body ?? {};
+    let value: string | null = null;
+    if (endsAt !== null) {
+      const d = typeof endsAt === 'string' ? new Date(endsAt) : null;
+      if (!d || Number.isNaN(d.getTime())) {
+        return sendError(res, 400, {
+          code: 'VALIDATION_ERROR',
+          message: 'Validation failed',
+          fields: { endsAt: 'endsAt must be an ISO date or null' },
+        });
+      }
+      value = d.toISOString();
+    }
+
+    await db
+      .insert(appSettings)
+      .values({ key: EARLY_ACCESS_KEY, value })
+      .onConflictDoUpdate({ target: appSettings.key, set: { value } });
+    clearEarlyAccessCache();
+
+    return sendSuccess(res, 200, await earlyAccessState(), 'Early access settings updated successfully');
+  } catch (error) {
+    console.error('Admin update early access error:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to update early access settings' });
   }
 });
 

@@ -12,7 +12,7 @@ import {
 } from '../utils/auth.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
-import { countOwnedProjects, FREE_SHOOT_LIMIT } from '../utils/plan.js';
+import { countOwnedProjects, FREE_SHOOT_LIMIT, hasPro, isEarlyAccessOpen } from '../utils/plan.js';
 import { sendPasswordResetEmail, sendSignupVerificationEmail } from '../utils/email.js';
 
 const router = Router();
@@ -455,13 +455,20 @@ router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     // Shoot allowance travels with the profile so the app can show "2 left"
     // anywhere without a second round trip or an unreliable client-side count
     // (the shoots list is filtered/paginated, so counting it there undercounts).
-    const shootsUsed = await countOwnedProjects(userId);
+    // Effective plan, not the raw admin flag — early-access accounts are Pro too.
+    const [shootsUsed, pro, earlyAccess] = await Promise.all([
+      countOwnedProjects(userId),
+      hasPro(user),
+      isEarlyAccessOpen(),
+    ]);
 
     return sendSuccess(res, 200, {
       user: {
         ...serializeUser(user),
+        isPro: pro,
+        earlyAccess,
         shootsUsed,
-        shootLimit: user.isPro ? null : FREE_SHOOT_LIMIT,
+        shootLimit: pro ? null : FREE_SHOOT_LIMIT,
       },
     }, 'User profile fetched successfully');
   } catch (error) {

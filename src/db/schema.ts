@@ -178,3 +178,13 @@ export const teamMembers = pgTable('team_members', {
 }, (t) => [
   unique().on(t.userId, t.memberId)
 ]);
+
+/**
+ * Admin-editable app settings, one row per key. Values are text so a new
+ * setting never needs a migration; each reader parses and validates its own.
+ */
+export const appSettings = pgTable('app_settings', {
+  key: text('key').primaryKey(),
+  value: text('value'),
+  updatedAt: updatedAt(),
+});

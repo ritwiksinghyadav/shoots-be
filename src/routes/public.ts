@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { projects, shootDays, shootMembers, shootMilestones, users } from '../db/schema.js';
 import { sendSuccess, sendError } from '../utils/response.js';
+import { hasPro } from '../utils/plan.js';
 
 const router = Router();
 
@@ -38,7 +39,13 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
     const token = String(req.params.token);
 
     const [projectData] = await db
-      .select({ project: projects, ownerName: users.name, ownerBusinessName: users.businessName })
+      .select({
+        project: projects,
+        ownerName: users.name,
+        ownerBusinessName: users.businessName,
+        ownerIsPro: users.isPro,
+        ownerCreatedAt: users.createdAt,
+      })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
       .where(eq(projects.shareToken, token))
@@ -50,22 +57,23 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
 
     const { project } = projectData;
 
-    const days = await db
-      .select()
-      .from(shootDays)
-      .where(eq(shootDays.projectId, project.id))
-      .orderBy(shootDays.shootOrder);
-
-    const milestones = await db
-      .select()
-      .from(shootMilestones)
-      .where(eq(shootMilestones.projectId, project.id));
-
-    const members = await db
-      .select({ name: users.name, email: users.email })
-      .from(shootMembers)
-      .innerJoin(users, eq(shootMembers.userId, users.id))
-      .where(eq(shootMembers.projectId, project.id));
+    const [days, milestones, members, ownerPro] = await Promise.all([
+      db
+        .select()
+        .from(shootDays)
+        .where(eq(shootDays.projectId, project.id))
+        .orderBy(shootDays.shootOrder),
+      db
+        .select()
+        .from(shootMilestones)
+        .where(eq(shootMilestones.projectId, project.id)),
+      db
+        .select({ name: users.name, email: users.email })
+        .from(shootMembers)
+        .innerJoin(users, eq(shootMembers.userId, users.id))
+        .where(eq(shootMembers.projectId, project.id)),
+      hasPro({ isPro: projectData.ownerIsPro, createdAt: projectData.ownerCreatedAt }),
+    ]);
 
     return sendSuccess(
       res,
@@ -78,6 +86,8 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
           productionStage: project.productionStage,
           ownerName: projectData.ownerName || 'Your photographer',
           ownerBusinessName: projectData.ownerBusinessName ?? null,
+          // Pro owners get an unbranded client page.
+          showBranding: !ownerPro,
           shootDays: days.map((d) => ({
             date: d.date,
             time: d.time,
