@@ -37,7 +37,7 @@ export const users = pgTable('users', {
   /** Membership tier, admin-controlled — no self-serve or payment flow behind this yet. */
   isPro: boolean('is_pro').default(false).notNull(),
   /**
-   * End of an admin-granted Pro term (12 months by default, see PRO_TERM_MONTHS).
+   * End of an admin-granted Pro term (6 months by default, see TERM_MONTHS.admin).
    * Pro is never permanent: once this passes the grant has lapsed even though
    * `isPro` is still true. Null only on grants made before dates existed.
    */

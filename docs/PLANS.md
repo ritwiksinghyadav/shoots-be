@@ -4,9 +4,10 @@ How SHOOTS decides which plan an account is on, when early access starts and
 ends, and how paid Pro (Razorpay) plugs in. The code that implements all of
 this is `src/utils/plan.ts`; every Pro check on the server goes through it.
 
-**The one rule to remember: Pro is always a 12-month term, never permanent.**
-Whether it's an early-bird year, an admin grant or (later) a paid year, it
-has an end date, and when that passes the account drops to Free.
+**The one rule to remember: Pro is always a dated term, never permanent.**
+Free Pro (an early-bird term or an admin grant) lasts **6 months**; paid Pro
+(later, via Razorpay) lasts **12 months** for ₹799. Every term has an end
+date, and when it passes the account drops to Free.
 
 ## The plans
 
@@ -34,27 +35,29 @@ last**. It returns `{ tier, source, proUntil, lapsed }`.
 
 | Source | Term | Starts | Ends |
 |---|---|---|---|
-| `early_access` | Early-bird year | The day the account activated, if before early access ended | 12 months later |
-| `admin` | Admin grant | When an admin grants it | 12 months later by default, or a date the admin picks |
+| `early_access` | Early-bird term | The day the account activated, if before early access ended | 6 months later |
+| `admin` | Admin grant | When an admin grants it | 6 months later by default, or a date the admin picks |
 | `subscription` | Paid year *(Razorpay, not built yet)* | Payment (or the end of the current term) | 12 months later |
 | `null` | Free | When no term is running | n/a |
 
 When nothing is running, `lapsed` says which term ended last and when, so the
-app can say "your free early-bird year ended on …".
+app can say "your free early-bird Pro ended on …".
 
 `GET /auth/me` returns `isPro`, `planSource`, `proUntil`, `proDaysLeft` and
 `proLapsed`, plus `earlyAccess` (still open?) and `earlyAccessEndsAt`. The
 admin users list shows `pro · until …`, `pro · early bird · until …`,
 `free · early bird ended …`, `free` or `invited`.
 
-The 12 months is `PRO_TERM_MONTHS` in `plan.ts`. Change it there and every
-term, count and message follows.
+Term lengths live in `TERM_MONTHS` in `plan.ts` (`early_access: 6`,
+`admin: 6`, `subscription: 12`). Change them there and the backend follows;
+the app, admin panel and landing page copy say "6 months" in text, so update
+those too.
 
-## Activation: when the early-bird year starts
+## Activation: when the early-bird term starts
 
 An account is **activated** the first time a password is set on it. That
 stamps `users.activated_at`, once; nothing ever moves it afterwards, so a
-later password reset can't restart a free year.
+later password reset can't restart a free term.
 
 | How the account became usable | Where `activated_at` is set |
 |---|---|
@@ -71,8 +74,8 @@ judged on the day they actually activate.
 
 `created_at` is deliberately **not** used. A crew invite creates the row the
 moment someone types an email, often weeks before that person ever opens
-SHOOTS. Using `created_at` would start (and use up) a free year for people
-who were only invited, and hand one to people who join after early access.
+SHOOTS. Using `created_at` would start (and use up) free Pro for people
+who were only invited, and hand it to people who join after early access.
 
 ## Early access: start and end
 
@@ -82,12 +85,12 @@ who were only invited, and hand one to people who join after early access.
 - **End.** An admin sets the end date in *Admin → Settings → Early access*
   (stored in `app_settings` as `early_access_ends_at`, cached for 30 seconds).
   It can be in the future (scheduled) or removed again to reopen.
-- **Each early bird's free year** runs 12 months from their own activation
-  date, not from the end of early access. Someone who joined in October 2026
-  is on Free from October 2027 unless they pay.
+- **Each early bird's free Pro** runs 6 months from their own activation
+  date, not from the end of early access. Someone who joined on 10 Oct 2026
+  is on Free from 10 Apr 2027 unless they pay.
 - **After the end date.** Anyone who activates on or after it starts on Free,
   including crew who were invited during early access but accept later.
-- **Moving the date.** Pulling the date earlier takes the free year away from
+- **Moving the date.** Pulling the date earlier takes free Pro away from
   people who activated after the new date. The admin panel asks for
   confirmation when the date is in the past.
 
@@ -95,29 +98,29 @@ who were only invited, and hand one to people who join after early access.
 
 | Person | What happened | Plan |
 |---|---|---|
-| Asha | Signed up 10 Oct 2026 | Pro until 10 Oct 2027, then Free unless she pays |
-| Ravi | Invited as crew 20 Dec 2026, set his password 28 Dec 2026 | Pro until 28 Dec 2027 |
+| Asha | Signed up 10 Oct 2026 | Pro until 10 Apr 2027, then Free unless she pays |
+| Ravi | Invited as crew 20 Dec 2026, set his password 28 Dec 2026 | Pro until 28 Jun 2027 |
 | Meena | Invited as crew 20 Dec 2026, set her password 5 Jan 2027 | Free |
 | Karan | Entered his email on signup 30 Dec 2026, verified 2 Jan 2027 | Free |
-| Neel | Signed up 3 Jan 2027, admin granted Pro that day | Pro until 3 Jan 2028 |
-| Asha, later | Admin grants her Pro on 1 Sep 2027 | Pro until 1 Sep 2028 (the later of her two terms) |
+| Neel | Signed up 3 Jan 2027, admin granted Pro that day | Pro until 3 Jul 2027 |
+| Asha, later | Admin grants her Pro on 1 Mar 2027 | Pro until 1 Sep 2027 (the later of her two terms) |
 
 ### Admin grants
 
-- **Grant 1 year Pro** (users list) or ticking *Pro member* (edit page) gives
-  12 months from that moment.
+- **Grant 6 months Pro** (users list) or ticking *Pro member* (edit page)
+  gives 6 months from that moment.
 - The edit page has a *Pro until* date for a different end.
 - Re-saving the edit form never extends a running grant; only a changed date
-  does. Granting again after a grant has ended starts a new 12 months.
+  does. Granting again after a grant has ended starts a new 6 months.
 - **Remove Pro** ends the grant immediately. It doesn't touch an early-bird
-  year that is still running.
+  term that is still running.
 
 ### Admin dashboard numbers
 
 *Settings → Early access* shows:
 
-- **Early birds, Pro running**: activated before the end date, still inside their year.
-- **Early birds, year ended**: their free year is over (Free unless another term is running).
+- **Early birds, Pro running**: activated before the end date, still inside their 6 months.
+- **Early birds, Pro ended**: their free 6 months are over (Free unless another term is running).
 - **Joined after end date**: activated on or after it, never early birds.
 - **Invited, not joined**: rows with no `activated_at`. Each becomes an early
   bird only if they activate before the end date.
@@ -132,15 +135,17 @@ matters, because the new backend code reads both:
    again with `--apply` to write:
    - every existing account with a password gets `activated_at` = the
      rollout (the moment the script runs), so everyone on SHOOTS at launch
-     gets a full free year from that day and nobody drops to Free on launch
-     day;
-   - every existing admin grant gets `pro_until` = 12 months from the run.
+     gets the full free term from that day and nobody drops to Free on
+     launch day;
+   - every existing admin grant gets `pro_until` = 6 months from the run.
 
    Placeholder rows stay empty.
 3. Deploy the backend, then the app and admin panel.
 
-**Done on 2 Oct 2026** (6 accounts activated at the rollout, 3 admin grants
-dated to 2 Oct 2027). The columns were added with the two `ALTER TABLE`
+**Done on 2 Oct 2026**: 6 accounts activated at the rollout (free Pro until
+2 Apr 2027) and 3 admin grants dated. The terms were first 12 months and cut
+to 6 the same day; the 3 grants were moved from 2 Oct 2027 to 2 Apr 2027.
+The columns were added with the two `ALTER TABLE`
 statements in the migration rather than `db:push`, because of the warning
 below.
 
@@ -187,7 +192,7 @@ while `status` is `active` (or `authenticated` / `pending` within a short
 grace window). Keep it in `plan.ts` so every gate (shoot limit, analytics,
 timeline, share-link branding) picks it up with no other changes.
 
-**Paying before a free year ends.** Start the paid year where the current
+**Paying before free Pro ends.** Start the paid year where the current
 term ends, not on the payment date, so nobody loses the free months they have
 left. For a Razorpay Subscription, set `start_at` to the current `proUntil`;
 for a one-off yearly payment, set the new period's end to
@@ -218,6 +223,8 @@ for a one-off yearly payment, set the new period's end to
 - **Renewal reminders.** `proDaysLeft` is already on `/auth/me`, and the plan
   page warns in the last 30 days. Add emails 30 and 7 days before `proUntil`
   once checkout exists, so early birds can pay before dropping to Free.
+- **Paid term length.** `TERM_MONTHS.subscription` (12) is what a paid term
+  should use; don't reuse the 6-month free terms for it.
 - **Don't double-sell.** Someone with a running term can pay early (the paid
   year stacks after it, see above), but don't let them start two
   subscriptions at once.

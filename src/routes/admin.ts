@@ -7,7 +7,7 @@ import { requireAdmin } from '../middleware/admin.js';
 import { hashPassword } from '../utils/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { serializeUser } from './auth.js';
-import { EARLY_ACCESS_KEY, PRO_TERM_MONTHS, addProTerm, getEarlyAccessEnd, clearEarlyAccessCache, markActivated, resolvePlan } from '../utils/plan.js';
+import { EARLY_ACCESS_KEY, TERM_MONTHS, addMonths, getEarlyAccessEnd, clearEarlyAccessCache, markActivated, resolvePlan } from '../utils/plan.js';
 
 const router = Router();
 
@@ -196,7 +196,7 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
     if (role !== undefined) updatePayload.role = role;
     if (isVerified !== undefined) updatePayload.isVerified = isVerified;
     // Admin Pro is a dated term like every other. An explicit proUntil wins;
-    // granting without one gives PRO_TERM_MONTHS from now, unless a grant is
+    // granting without one gives TERM_MONTHS.admin from now, unless a grant is
     // already running (re-saving the edit form must not quietly extend it).
     if (isPro === false) {
       updatePayload.isPro = false;
@@ -210,7 +210,7 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
       const running = current?.isPro && (!current.proUntil || current.proUntil > new Date());
       updatePayload.isPro = true;
       if (proUntilDate) updatePayload.proUntil = proUntilDate;
-      else if (!running) updatePayload.proUntil = addProTerm(new Date());
+      else if (!running) updatePayload.proUntil = addMonths(new Date(), TERM_MONTHS.admin);
     }
     if (preferredCurrency !== undefined) updatePayload.preferredCurrency = preferredCurrency;
 
@@ -587,8 +587,8 @@ router.delete('/admin/feedback/:id', async (req: AuthenticatedRequest, res: Resp
  * Early access state plus who it affects. Everything is judged on activation
  * (first password set), not on when the row was created:
  *  - earlyBirdsActive: activated before the end date (or while there is none)
- *    and still inside their free PRO_TERM_MONTHS
- *  - earlyBirdsEnded: early birds whose free year has run out (Free unless
+ *    and still inside their free TERM_MONTHS.early_access
+ *  - earlyBirdsEnded: early birds whose free term has run out (Free unless
  *    they have another running term, e.g. an admin grant)
  *  - joinedAfter: activated on or after the end date, so never early birds
  *  - notActivated: invited or half-signed-up rows; they become early birds
@@ -597,7 +597,7 @@ router.delete('/admin/feedback/:id', async (req: AuthenticatedRequest, res: Resp
 async function earlyAccessState() {
   const endsAt = await getEarlyAccessEnd();
   const earlyBird = and(isNotNull(users.activatedAt), endsAt ? lt(users.activatedAt, endsAt) : undefined);
-  const termStart = sql`now() - make_interval(months => ${PRO_TERM_MONTHS})`;
+  const termStart = sql`now() - make_interval(months => ${TERM_MONTHS.early_access})`;
   const total = (where: SQL | undefined) =>
     db.select({ total: count() }).from(users).where(where).then(([r]) => Number(r?.total ?? 0));
 
@@ -611,7 +611,8 @@ async function earlyAccessState() {
   return {
     endsAt: endsAt?.toISOString() ?? null,
     open: !endsAt || new Date() < endsAt,
-    termMonths: PRO_TERM_MONTHS,
+    earlyBirdMonths: TERM_MONTHS.early_access,
+    adminGrantMonths: TERM_MONTHS.admin,
     earlyBirdsActive,
     earlyBirdsEnded,
     joinedAfter,
@@ -630,7 +631,7 @@ router.get('/admin/settings/early-access', async (_req: AuthenticatedRequest, re
 });
 
 // PUT /admin/settings/early-access — { endsAt: ISO string | null }. null
-// reopens early access: anyone activating while it's open gets a free Pro year.
+// reopens early access: anyone activating while it's open gets a free Pro term.
 router.put('/admin/settings/early-access', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { endsAt } = req.body ?? {};

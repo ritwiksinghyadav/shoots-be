@@ -12,7 +12,7 @@ import { sendError } from './response.js';
  * Pro is always a dated term, never permanent. An account is Pro while at
  * least one of these is still running, and the one that ends last wins:
  *   - admin          users.isPro, valid until users.proUntil (granted from the admin panel)
- *   - early_access   PRO_TERM_MONTHS from activation, if activated before early access ended
+ *   - early_access   TERM_MONTHS.early_access from activation, if activated before early access ended
  *   - (subscription) a paid Razorpay period, once billing is built
  * When none is running, the account is on Free.
  */
@@ -23,19 +23,26 @@ export const FREE_SHOOT_LIMIT = 3;
 /** How far back Free accounts can see their own money. */
 export const FREE_ANALYTICS_MONTHS = 12;
 
-/** Length of every Pro term: an early-bird year, an admin grant, a paid year. */
-export const PRO_TERM_MONTHS = 12;
+/**
+ * Length of each kind of Pro term, in months. Free terms (early bird, admin
+ * grant) are short; a paid term is the full year that ₹799 buys.
+ */
+export const TERM_MONTHS = {
+  early_access: 6,
+  admin: 6,
+  subscription: 12,
+} as const;
 
-/** The end of a Pro term that starts at `from`. */
-export function addProTerm(from: Date): Date {
+/** `from` plus a number of calendar months (UTC). */
+export function addMonths(from: Date, months: number): Date {
   const d = new Date(from);
-  d.setUTCMonth(d.getUTCMonth() + PRO_TERM_MONTHS);
+  d.setUTCMonth(d.getUTCMonth() + months);
   return d;
 }
 
 /**
  * Early access: every account *activated* before the end date gets its first
- * PRO_TERM_MONTHS of Pro free, counted from the day it activated. After that
+ * TERM_MONTHS.early_access of Pro free, counted from the day it activated. After that
  * it drops to Free until it pays. Activation, not row creation, is what counts: a crew invite creates the row
  * long before the person ever signs in, and that must not lock in Pro for them.
  * No date means early access is still running. Admins set the date from the
@@ -96,7 +103,7 @@ export interface Plan {
   proUntil: Date | null;
   /**
    * On Free after a Pro term ran out: which one, and when. Lets the app say
-   * "your early-bird year ended on …" instead of a generic upgrade prompt.
+   * "your free early-bird Pro ended on …" instead of a generic upgrade prompt.
    */
   lapsed: { source: Exclude<PlanSource, null>; endedAt: Date } | null;
 }
@@ -110,10 +117,10 @@ export interface Plan {
 export function earlyBirdUntil(user: PlanUser, end: Date | null): Date | null {
   if (!user.activatedAt) return null;
   if (end && user.activatedAt >= end) return null;
-  return addProTerm(user.activatedAt);
+  return addMonths(user.activatedAt, TERM_MONTHS.early_access);
 }
 
-/** True while the early-bird year is running and no other term outlasts it. */
+/** True while the early-bird term is running and no other term outlasts it. */
 export function isEarlyAccessPro(user: PlanUser, end: Date | null, now = new Date()): boolean {
   return resolvePlan(user, end, now).source === 'early_access';
 }
@@ -160,7 +167,7 @@ export async function isProUser(userId: string): Promise<boolean> {
 /**
  * Stamps `activatedAt` the first time an account becomes usable. Safe to call
  * on every password set or sign-in: it never moves an existing date, so a
- * later password reset can't restart an early-bird year.
+ * later password reset can't restart an early-bird term.
  */
 export async function markActivated(userId: string): Promise<void> {
   await db
