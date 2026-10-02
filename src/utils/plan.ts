@@ -1,14 +1,20 @@
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import { Response } from 'express';
 import { db } from '../db/index.js';
 import { users, projects, appSettings } from '../db/schema.js';
 import { sendError } from './response.js';
 
 /**
- * Plan gates. An account is Pro if an admin set `users.isPro`, or if it was
- * created during early access (see below) — there is no checkout yet. Every
- * limit below is enforced here, on the server, because the frontend copy is
- * only a hint: a crafted request must not be able to buy itself Pro behaviour.
+ * Plan gates. Every limit below is enforced here, on the server, because the
+ * frontend copy is only a hint: a crafted request must not be able to buy
+ * itself Pro behaviour. See docs/PLANS.md for the full model.
+ *
+ * Pro is always a dated term, never permanent. An account is Pro while at
+ * least one of these is still running, and the one that ends last wins:
+ *   - admin          users.isPro, valid until users.proUntil (granted from the admin panel)
+ *   - early_access   PRO_TERM_MONTHS from activation, if activated before early access ended
+ *   - (subscription) a paid Razorpay period, once billing is built
+ * When none is running, the account is on Free.
  */
 
 /** Total shoots a Free account may create, in any status. */
@@ -17,12 +23,23 @@ export const FREE_SHOOT_LIMIT = 3;
 /** How far back Free accounts can see their own money. */
 export const FREE_ANALYTICS_MONTHS = 12;
 
+/** Length of every Pro term: an early-bird year, an admin grant, a paid year. */
+export const PRO_TERM_MONTHS = 12;
+
+/** The end of a Pro term that starts at `from`. */
+export function addProTerm(from: Date): Date {
+  const d = new Date(from);
+  d.setUTCMonth(d.getUTCMonth() + PRO_TERM_MONTHS);
+  return d;
+}
+
 /**
- * Early access keeps its promise: "join now, keep Pro free when paid plans
- * start". Every account created before the end date is Pro for good, with no
- * data migration needed. No date means early access is still running, so
- * every account is Pro. Admins set the date from the admin panel; it lives in
- * `app_settings` under this key as an ISO timestamp.
+ * Early access: every account *activated* before the end date gets its first
+ * PRO_TERM_MONTHS of Pro free, counted from the day it activated. After that
+ * it drops to Free until it pays. Activation, not row creation, is what counts: a crew invite creates the row
+ * long before the person ever signs in, and that must not lock in Pro for them.
+ * No date means early access is still running. Admins set the date from the
+ * admin panel; it lives in `app_settings` under this key as an ISO timestamp.
  */
 export const EARLY_ACCESS_KEY = 'early_access_ends_at';
 
@@ -65,25 +82,91 @@ export async function isEarlyAccessOpen(now = new Date()): Promise<boolean> {
   return !end || now < end;
 }
 
-type PlanUser = { isPro: boolean; createdAt: Date };
+export type PlanUser = { isPro: boolean; proUntil: Date | null; activatedAt: Date | null };
 
-/** Pro only because the account joined during early access (not admin-granted). */
-export function isEarlyAccessPro(user: PlanUser, end: Date | null): boolean {
-  return !user.isPro && (!end || user.createdAt < end);
+export type PlanTier = 'free' | 'pro';
+/** Where a Pro term comes from. `null` means plain Free. */
+export type PlanSource = 'admin' | 'early_access' | null;
+
+export interface Plan {
+  tier: PlanTier;
+  /** The running term that ends last, or null on Free. */
+  source: PlanSource;
+  /** When the current Pro term ends. Null on Free. */
+  proUntil: Date | null;
+  /**
+   * On Free after a Pro term ran out: which one, and when. Lets the app say
+   * "your early-bird year ended on …" instead of a generic upgrade prompt.
+   */
+  lapsed: { source: Exclude<PlanSource, null>; endedAt: Date } | null;
 }
 
-/** The one place that decides whether an account gets Pro. */
+/**
+ * The early-bird term, if the account qualifies: activated while early access
+ * was open. Never-activated rows (an invited crew member who hasn't signed in
+ * yet) don't qualify until they activate. Returns the term's end date, whether
+ * or not it has passed.
+ */
+export function earlyBirdUntil(user: PlanUser, end: Date | null): Date | null {
+  if (!user.activatedAt) return null;
+  if (end && user.activatedAt >= end) return null;
+  return addProTerm(user.activatedAt);
+}
+
+/** True while the early-bird year is running and no other term outlasts it. */
+export function isEarlyAccessPro(user: PlanUser, end: Date | null, now = new Date()): boolean {
+  return resolvePlan(user, end, now).source === 'early_access';
+}
+
+// Stand-in end for an admin grant made before grants carried a date. The
+// backfill script dates them; until then they keep running, reported as null.
+const UNDATED = new Date(8.64e15);
+
+/** Pure plan resolution, for callers that already hold the end date (lists). */
+export function resolvePlan(user: PlanUser, end: Date | null, now = new Date()): Plan {
+  const terms: { source: Exclude<PlanSource, null>; until: Date }[] = [];
+  if (user.isPro) terms.push({ source: 'admin', until: user.proUntil ?? UNDATED });
+  const earlyBird = earlyBirdUntil(user, end);
+  if (earlyBird) terms.push({ source: 'early_access', until: earlyBird });
+
+  const running = terms.filter((t) => t.until > now).sort((a, b) => b.until.getTime() - a.until.getTime());
+  if (running.length) {
+    const t = running[0];
+    return { tier: 'pro', source: t.source, proUntil: t.until === UNDATED ? null : t.until, lapsed: null };
+  }
+
+  const ended = terms.sort((a, b) => b.until.getTime() - a.until.getTime())[0];
+  return { tier: 'free', source: null, proUntil: null, lapsed: ended ? { source: ended.source, endedAt: ended.until } : null };
+}
+
+/** The one place that decides which plan an account is on. */
+export async function getPlan(user: PlanUser): Promise<Plan> {
+  return resolvePlan(user, await getEarlyAccessEnd());
+}
+
 export async function hasPro(user: PlanUser): Promise<boolean> {
-  return user.isPro || isEarlyAccessPro(user, await getEarlyAccessEnd());
+  return (await getPlan(user)).tier === 'pro';
 }
 
 export async function isProUser(userId: string): Promise<boolean> {
   const [row] = await db
-    .select({ isPro: users.isPro, createdAt: users.createdAt })
+    .select({ isPro: users.isPro, proUntil: users.proUntil, activatedAt: users.activatedAt })
     .from(users)
     .where(eq(users.id, userId))
     .limit(1);
   return row ? hasPro(row) : false;
+}
+
+/**
+ * Stamps `activatedAt` the first time an account becomes usable. Safe to call
+ * on every password set or sign-in: it never moves an existing date, so a
+ * later password reset can't restart an early-bird year.
+ */
+export async function markActivated(userId: string): Promise<void> {
+  await db
+    .update(users)
+    .set({ activatedAt: new Date() })
+    .where(and(eq(users.id, userId), isNull(users.activatedAt)));
 }
 
 /** Every shoot the user owns, whatever its status — the cap is on creation. */

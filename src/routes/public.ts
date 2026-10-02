@@ -44,7 +44,8 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
         ownerName: users.name,
         ownerBusinessName: users.businessName,
         ownerIsPro: users.isPro,
-        ownerCreatedAt: users.createdAt,
+        ownerProUntil: users.proUntil,
+        ownerActivatedAt: users.activatedAt,
       })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
@@ -72,7 +73,7 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
         .from(shootMembers)
         .innerJoin(users, eq(shootMembers.userId, users.id))
         .where(eq(shootMembers.projectId, project.id)),
-      hasPro({ isPro: projectData.ownerIsPro, createdAt: projectData.ownerCreatedAt }),
+      hasPro({ isPro: projectData.ownerIsPro, proUntil: projectData.ownerProUntil, activatedAt: projectData.ownerActivatedAt }),
     ]);
 
     return sendSuccess(

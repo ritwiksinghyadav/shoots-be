@@ -12,7 +12,7 @@ import {
 } from '../utils/auth.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
-import { countOwnedProjects, FREE_SHOOT_LIMIT, hasPro, isEarlyAccessOpen } from '../utils/plan.js';
+import { countOwnedProjects, FREE_SHOOT_LIMIT, getEarlyAccessEnd, markActivated, resolvePlan } from '../utils/plan.js';
 import { sendPasswordResetEmail, sendSignupVerificationEmail } from '../utils/email.js';
 
 const router = Router();
@@ -129,6 +129,8 @@ router.post('/auth/register', async (req, res) => {
         name: name.trim(),
         email: cleanEmail,
         passwordHash,
+        // No password means a placeholder (e.g. a crew invite): not activated yet.
+        activatedAt: passwordHash ? new Date() : null,
         businessName: businessName?.trim() || null,
         invitedBy: invitedBy || null,
       })
@@ -284,6 +286,10 @@ router.post('/auth/login', async (req, res) => {
         message: 'Invalid email or password',
       });
     }
+
+    // Accounts that had a password before activation was tracked get stamped
+    // on their first sign-in; a no-op for everyone else.
+    if (!user.activatedAt) await markActivated(user.id);
 
     // 4. Generate tokens
     const { accessToken, refreshToken } = await issueSessionTokens(user);
@@ -456,17 +462,32 @@ router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     // anywhere without a second round trip or an unreliable client-side count
     // (the shoots list is filtered/paginated, so counting it there undercounts).
     // Effective plan, not the raw admin flag — early-access accounts are Pro too.
-    const [shootsUsed, pro, earlyAccess] = await Promise.all([
+    const [shootsUsed, earlyAccessEnd] = await Promise.all([
       countOwnedProjects(userId),
-      hasPro(user),
-      isEarlyAccessOpen(),
+      getEarlyAccessEnd(),
     ]);
+    const plan = resolvePlan(user, earlyAccessEnd);
+    const pro = plan.tier === 'pro';
 
     return sendSuccess(res, 200, {
       user: {
         ...serializeUser(user),
         isPro: pro,
-        earlyAccess,
+        /** The running Pro term: 'admin' | 'early_access', or null on Free. */
+        planSource: plan.source,
+        /** When the current Pro term ends (ISO). Null on Free. */
+        proUntil: plan.proUntil?.toISOString() ?? null,
+        /** Whole days left in the current Pro term, for "ends in N days" nudges. */
+        proDaysLeft: plan.proUntil
+          ? Math.max(0, Math.ceil((plan.proUntil.getTime() - Date.now()) / 86_400_000))
+          : null,
+        /** On Free after a Pro term ran out: which one and when. */
+        proLapsed: plan.lapsed
+          ? { source: plan.lapsed.source, endedAt: plan.lapsed.endedAt.toISOString() }
+          : null,
+        /** Whether early access is still open for new activations. */
+        earlyAccess: !earlyAccessEnd || new Date() < earlyAccessEnd,
+        earlyAccessEndsAt: earlyAccessEnd?.toISOString() ?? null,
         shootsUsed,
         shootLimit: pro ? null : FREE_SHOOT_LIMIT,
       },
@@ -600,6 +621,7 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     // session hijacked before the change keeps working. The settings page signs
     // the user out itself so this isn't a surprise mid-session.
     if (updatePayload.passwordHash) {
+      await markActivated(userId);
       await revokeAllSessions(userId);
     }
 
@@ -789,6 +811,10 @@ router.post('/auth/reset-password', async (req, res) => {
         resetTokenExpiry: null,
       })
       .where(eq(users.id, user.id));
+
+    // This is also how a signup is verified and a crew invite is claimed, so it
+    // activates the account the first time round (and never moves the date after).
+    await markActivated(user.id);
 
     // Whoever reset the password now owns the account — drop every session that
     // existed beforehand, since this is the flow used to recover a compromised one.

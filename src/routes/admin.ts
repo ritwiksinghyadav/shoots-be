@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { eq, and, or, desc, like, sql, ne, count, gte } from 'drizzle-orm';
+import { eq, and, or, desc, like, sql, ne, count, gte, lt, isNull, isNotNull, type SQL } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { users, projects, shootDays, shootMembers, expenses, feedback, appSettings } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
@@ -7,9 +7,26 @@ import { requireAdmin } from '../middleware/admin.js';
 import { hashPassword } from '../utils/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { serializeUser } from './auth.js';
-import { EARLY_ACCESS_KEY, getEarlyAccessEnd, clearEarlyAccessCache, isEarlyAccessPro } from '../utils/plan.js';
+import { EARLY_ACCESS_KEY, PRO_TERM_MONTHS, addProTerm, getEarlyAccessEnd, clearEarlyAccessCache, markActivated, resolvePlan } from '../utils/plan.js';
 
 const router = Router();
+
+type UserRow = typeof users.$inferSelect;
+
+/** A user as the admin panel sees it: profile plus the plan it resolves to. */
+function withPlan(user: UserRow, earlyAccessEnd: Date | null) {
+  const plan = resolvePlan(user, earlyAccessEnd);
+  return {
+    ...serializeUser(user),
+    plan: {
+      tier: plan.tier,
+      source: plan.source,
+      proUntil: plan.proUntil?.toISOString() ?? null,
+      lapsed: plan.lapsed ? { source: plan.lapsed.source, endedAt: plan.lapsed.endedAt.toISOString() } : null,
+    },
+    earlyAccessPro: plan.source === 'early_access',
+  };
+}
 
 router.use(requireAuth, requireAdmin);
 
@@ -52,10 +69,7 @@ router.get('/admin/users', async (req: AuthenticatedRequest, res: Response) => {
     const total = Number(countResult?.count ?? 0);
     const pages = Math.ceil(total / limit) || 1;
 
-    const items = rows.map((u) => ({
-      ...serializeUser(u),
-      earlyAccessPro: isEarlyAccessPro(u, earlyAccessEnd),
-    }));
+    const items = rows.map((u) => withPlan(u, earlyAccessEnd));
 
     return sendSuccess(
       res,
@@ -101,6 +115,7 @@ router.post('/admin/users', async (req: AuthenticatedRequest, res: Response) => 
         name: name.trim(),
         email: cleanEmail,
         passwordHash,
+        activatedAt: passwordHash ? new Date() : null,
         businessName: businessName?.trim() || null,
         role: role || 'user',
       })
@@ -130,7 +145,7 @@ router.get('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
       res,
       200,
       {
-        user: { ...serializeUser(user), earlyAccessPro: isEarlyAccessPro(user, earlyAccessEnd) },
+        user: withPlan(user, earlyAccessEnd),
         counts: {
           shootsOwned: Number(shootsOwned?.count ?? 0),
           feedbackSubmitted: Number(feedbackCount?.count ?? 0),
@@ -148,7 +163,7 @@ router.get('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
 router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = String(req.params.id);
-    const { name, email, businessName, phone, occupation, role, isVerified, isPro, preferredCurrency, password } = req.body;
+    const { name, email, businessName, phone, occupation, role, isVerified, isPro, proUntil, preferredCurrency, password } = req.body;
 
     const fields: Record<string, string> = {};
     if (name !== undefined && (!name || typeof name !== 'string' || !name.trim())) fields.name = 'Name cannot be empty';
@@ -156,6 +171,10 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
     if (role !== undefined && role !== 'user' && role !== 'admin') fields.role = 'Role must be "user" or "admin"';
     if (isVerified !== undefined && typeof isVerified !== 'boolean') fields.isVerified = 'isVerified must be a boolean';
     if (isPro !== undefined && typeof isPro !== 'boolean') fields.isPro = 'isPro must be a boolean';
+    const proUntilDate = typeof proUntil === 'string' ? new Date(proUntil) : null;
+    if (proUntil !== undefined && proUntil !== null && (!proUntilDate || Number.isNaN(proUntilDate.getTime()))) {
+      fields.proUntil = 'proUntil must be an ISO date or null';
+    }
     if (preferredCurrency !== undefined && !VALID_CURRENCIES.includes(preferredCurrency)) fields.preferredCurrency = 'Invalid currency code';
     if (password !== undefined && password !== null && (typeof password !== 'string' || password.length < 8)) {
       fields.password = 'Password must be at least 8 characters';
@@ -166,7 +185,7 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
     }
 
     type UserUpdateData = Partial<
-      Pick<typeof users.$inferInsert, 'name' | 'email' | 'businessName' | 'phone' | 'occupation' | 'role' | 'isVerified' | 'isPro' | 'preferredCurrency' | 'passwordHash'>
+      Pick<typeof users.$inferInsert, 'name' | 'email' | 'businessName' | 'phone' | 'occupation' | 'role' | 'isVerified' | 'isPro' | 'proUntil' | 'preferredCurrency' | 'passwordHash'>
     > & { updatedAt: Date };
     const updatePayload: UserUpdateData = { updatedAt: new Date() };
 
@@ -176,7 +195,23 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
     if (occupation !== undefined) updatePayload.occupation = occupation?.trim() || null;
     if (role !== undefined) updatePayload.role = role;
     if (isVerified !== undefined) updatePayload.isVerified = isVerified;
-    if (isPro !== undefined) updatePayload.isPro = isPro;
+    // Admin Pro is a dated term like every other. An explicit proUntil wins;
+    // granting without one gives PRO_TERM_MONTHS from now, unless a grant is
+    // already running (re-saving the edit form must not quietly extend it).
+    if (isPro === false) {
+      updatePayload.isPro = false;
+      updatePayload.proUntil = null;
+    } else if (isPro === true || proUntilDate) {
+      const [current] = await db
+        .select({ isPro: users.isPro, proUntil: users.proUntil })
+        .from(users)
+        .where(eq(users.id, id))
+        .limit(1);
+      const running = current?.isPro && (!current.proUntil || current.proUntil > new Date());
+      updatePayload.isPro = true;
+      if (proUntilDate) updatePayload.proUntil = proUntilDate;
+      else if (!running) updatePayload.proUntil = addProTerm(new Date());
+    }
     if (preferredCurrency !== undefined) updatePayload.preferredCurrency = preferredCurrency;
 
     if (email !== undefined) {
@@ -198,6 +233,10 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
 
     const [updatedUser] = await db.update(users).set(updatePayload).where(eq(users.id, id)).returning();
     if (!updatedUser) return sendError(res, 404, { code: 'NOT_FOUND', message: 'User not found' });
+    if (updatePayload.passwordHash && !updatedUser.activatedAt) {
+      await markActivated(updatedUser.id);
+      updatedUser.activatedAt = new Date();
+    }
 
     return sendSuccess(res, 200, { user: serializeUser(updatedUser) }, 'User updated successfully');
   } catch (error) {
@@ -545,23 +584,38 @@ router.delete('/admin/feedback/:id', async (req: AuthenticatedRequest, res: Resp
 // ─── Settings ───────────────────────────────────────────────────────────────
 
 /**
- * Early access state plus who it affects: accounts created on or after the
- * end date without an admin-granted Pro flag are the ones on Free.
+ * Early access state plus who it affects. Everything is judged on activation
+ * (first password set), not on when the row was created:
+ *  - earlyBirdsActive: activated before the end date (or while there is none)
+ *    and still inside their free PRO_TERM_MONTHS
+ *  - earlyBirdsEnded: early birds whose free year has run out (Free unless
+ *    they have another running term, e.g. an admin grant)
+ *  - joinedAfter: activated on or after the end date, so never early birds
+ *  - notActivated: invited or half-signed-up rows; they become early birds
+ *    only if they activate before the end date
  */
 async function earlyAccessState() {
   const endsAt = await getEarlyAccessEnd();
-  let freeAccounts = 0;
-  if (endsAt) {
-    const [row] = await db
-      .select({ total: count() })
-      .from(users)
-      .where(and(eq(users.isPro, false), gte(users.createdAt, endsAt)));
-    freeAccounts = Number(row?.total ?? 0);
-  }
+  const earlyBird = and(isNotNull(users.activatedAt), endsAt ? lt(users.activatedAt, endsAt) : undefined);
+  const termStart = sql`now() - make_interval(months => ${PRO_TERM_MONTHS})`;
+  const total = (where: SQL | undefined) =>
+    db.select({ total: count() }).from(users).where(where).then(([r]) => Number(r?.total ?? 0));
+
+  const [earlyBirdsActive, earlyBirdsEnded, joinedAfter, notActivated] = await Promise.all([
+    total(and(earlyBird, sql`${users.activatedAt} > ${termStart}`)),
+    total(and(earlyBird, sql`${users.activatedAt} <= ${termStart}`)),
+    endsAt ? total(gte(users.activatedAt, endsAt)) : Promise.resolve(0),
+    total(isNull(users.activatedAt)),
+  ]);
+
   return {
     endsAt: endsAt?.toISOString() ?? null,
     open: !endsAt || new Date() < endsAt,
-    freeAccounts,
+    termMonths: PRO_TERM_MONTHS,
+    earlyBirdsActive,
+    earlyBirdsEnded,
+    joinedAfter,
+    notActivated,
   };
 }
 
@@ -576,7 +630,7 @@ router.get('/admin/settings/early-access', async (_req: AuthenticatedRequest, re
 });
 
 // PUT /admin/settings/early-access — { endsAt: ISO string | null }. null
-// reopens early access, which makes every account Pro again.
+// reopens early access: anyone activating while it's open gets a free Pro year.
 router.put('/admin/settings/early-access', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { endsAt } = req.body ?? {};

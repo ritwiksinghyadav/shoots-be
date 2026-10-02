@@ -36,6 +36,20 @@ export const users = pgTable('users', {
   isVerified: boolean('is_verified').default(false).notNull(),
   /** Membership tier, admin-controlled — no self-serve or payment flow behind this yet. */
   isPro: boolean('is_pro').default(false).notNull(),
+  /**
+   * End of an admin-granted Pro term (12 months by default, see PRO_TERM_MONTHS).
+   * Pro is never permanent: once this passes the grant has lapsed even though
+   * `isPro` is still true. Null only on grants made before dates existed.
+   */
+  proUntil: timestamp('pro_until', { withTimezone: true }),
+  /**
+   * When the account first became usable, i.e. a password was first set
+   * (direct signup, claiming a crew invite, or an admin setting one). Null for
+   * placeholder rows created by a crew invite or an unfinished signup. Early
+   * access is judged on this, not `createdAt`: being invited by someone else
+   * during early access must not grant Pro to a person who joins later.
+   */
+  activatedAt: timestamp('activated_at', { withTimezone: true }),
   resetToken: text('reset_token'),
   resetTokenExpiry: timestamp('reset_token_expiry', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
