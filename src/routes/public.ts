@@ -46,6 +46,7 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
         ownerIsPro: users.isPro,
         ownerProUntil: users.proUntil,
         ownerActivatedAt: users.activatedAt,
+        ownerPaidProUntil: users.paidProUntil,
       })
       .from(projects)
       .innerJoin(users, eq(projects.ownerId, users.id))
@@ -73,7 +74,7 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
         .from(shootMembers)
         .innerJoin(users, eq(shootMembers.userId, users.id))
         .where(eq(shootMembers.projectId, project.id)),
-      hasPro({ isPro: projectData.ownerIsPro, proUntil: projectData.ownerProUntil, activatedAt: projectData.ownerActivatedAt }),
+      hasPro({ isPro: projectData.ownerIsPro, proUntil: projectData.ownerProUntil, activatedAt: projectData.ownerActivatedAt, paidProUntil: projectData.ownerPaidProUntil }),
     ]);
 
     return sendSuccess(
@@ -95,7 +96,9 @@ router.get('/public/shoot/:token', async (req, res: Response) => {
             location: d.locationJSON as { name: string; mapsUrl?: string },
             notes: d.eventTitle ?? undefined,
           })),
-          milestones: milestones
+          // The delivery timeline is a Pro feature; it disappears from the
+          // client page when the owner's Pro ends, and comes back if they renew.
+          milestones: (ownerPro ? milestones : [])
             .slice()
             .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
             .map((m) => ({

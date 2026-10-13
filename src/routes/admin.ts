@@ -1,7 +1,10 @@
 import { Router, Response } from 'express';
 import { eq, and, or, desc, like, sql, ne, count, gte, lt, isNull, isNotNull, type SQL } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { users, projects, shootDays, shootMembers, expenses, feedback, appSettings } from '../db/schema.js';
+import { users, projects, shootDays, shootMembers, expenses, feedback, appSettings, payments, refreshSessions } from '../db/schema.js';
+import { MONEY_MESSAGE, isOptionalText, parseMoney } from '../utils/validate.js';
+import { markRefunded, serializePayment } from '../utils/billing.js';
+import { RazorpayError, refundPayment } from '../utils/razorpay.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { requireAdmin } from '../middleware/admin.js';
 import { hashPassword } from '../utils/auth.js';
@@ -28,7 +31,7 @@ function withPlan(user: UserRow, earlyAccessEnd: Date | null) {
   };
 }
 
-router.use(requireAuth, requireAdmin);
+router.use('/admin', requireAuth, requireAdmin);
 
 const VALID_CURRENCIES = ['USD', 'EUR', 'GBP', 'INR', 'AED', 'SGD', 'JPY', 'AUD', 'CAD', 'CHF', 'HKD', 'MYR', 'THB', 'NZD'];
 
@@ -233,9 +236,16 @@ router.put('/admin/users/:id', async (req: AuthenticatedRequest, res: Response) 
 
     const [updatedUser] = await db.update(users).set(updatePayload).where(eq(users.id, id)).returning();
     if (!updatedUser) return sendError(res, 404, { code: 'NOT_FOUND', message: 'User not found' });
-    if (updatePayload.passwordHash && !updatedUser.activatedAt) {
-      await markActivated(updatedUser.id);
-      updatedUser.activatedAt = new Date();
+    if (updatePayload.passwordHash) {
+      if (!updatedUser.activatedAt) {
+        await markActivated(updatedUser.id);
+        updatedUser.activatedAt = new Date();
+      }
+      // Same rule as a user's own password change: every existing session ends.
+      await db
+        .update(refreshSessions)
+        .set({ revokedAt: new Date() })
+        .where(and(eq(refreshSessions.userId, updatedUser.id), isNull(refreshSessions.revokedAt)));
     }
 
     return sendSuccess(res, 200, { user: serializeUser(updatedUser) }, 'User updated successfully');
@@ -424,7 +434,9 @@ router.put('/admin/shoots/:id', async (req: AuthenticatedRequest, res: Response)
     const fields: Record<string, string> = {};
     if (title !== undefined && (!title || typeof title !== 'string' || !title.trim())) fields.title = 'Title cannot be empty';
     if (client !== undefined && (!client || typeof client !== 'string' || !client.trim())) fields.client = 'Client cannot be empty';
-    if (budget !== undefined && (isNaN(Number(budget)) || Number(budget) < 0)) fields.budget = 'Budget must be a valid number';
+    if (budget !== undefined && parseMoney(budget) === null) fields.budget = MONEY_MESSAGE;
+    if (status !== undefined && !['inquiry', 'booked', 'paid'].includes(status)) fields.status = 'Status must be inquiry, booked or paid';
+    if (!isOptionalText(notes)) fields.notes = 'Notes must be text up to 5000 characters';
     if (productionStage !== undefined && (!productionStage || typeof productionStage !== 'string' || !productionStage.trim())) {
       fields.productionStage = 'Stage cannot be empty';
     }
@@ -438,8 +450,8 @@ router.put('/admin/shoots/:id', async (req: AuthenticatedRequest, res: Response)
         ...(title !== undefined && { title: title.trim() }),
         ...(client !== undefined && { client: client.trim() }),
         ...(status !== undefined && { status }),
-        ...(budget !== undefined && { budget: Number(budget) }),
-        ...(notes !== undefined && { notes: notes.trim() }),
+        ...(budget !== undefined && { budget: parseMoney(budget)! }),
+        ...(notes !== undefined && { notes: typeof notes === 'string' ? notes.trim() : null }),
         ...(productionStage !== undefined && { productionStage: productionStage.trim() }),
         updatedAt: new Date(),
       })
@@ -658,6 +670,98 @@ router.put('/admin/settings/early-access', async (req: AuthenticatedRequest, res
   } catch (error) {
     console.error('Admin update early access error:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to update early access settings' });
+  }
+});
+
+// ─── Payments ───────────────────────────────────────────────────────────────
+
+const PAYMENT_STATUSES = ['created', 'paid', 'failed', 'refunded', 'partially_refunded'];
+
+// GET /admin/payments — every Razorpay order, newest first. Filter by status,
+// userId, or q (email, order id or payment id).
+router.get('/admin/payments', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
+    const limit = Math.max(1, parseInt(String(req.query.limit ?? '20'), 10) || 20);
+    const offset = (page - 1) * limit;
+    const { status, userId } = req.query;
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+
+    const conditions: SQL[] = [];
+    if (typeof status === 'string' && PAYMENT_STATUSES.includes(status)) conditions.push(eq(payments.status, status));
+    if (typeof userId === 'string' && userId) conditions.push(eq(payments.userId, userId));
+    if (q) {
+      const pattern = `%${q}%`;
+      conditions.push(or(
+        like(sql`lower(${payments.email})`, pattern),
+        like(sql`lower(${payments.orderId})`, pattern),
+        like(sql`lower(${payments.paymentId})`, pattern),
+      )!);
+    }
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const [[countResult], [totals], rows] = await Promise.all([
+      db.select({ count: count() }).from(payments).where(where),
+      // Money in, net of refunds, across every paid payment (ignores filters).
+      db
+        .select({ collected: sql<number>`coalesce(sum(${payments.amount} - ${payments.amountRefunded}), 0)::int` })
+        .from(payments)
+        .where(sql`${payments.status} IN ('paid', 'refunded', 'partially_refunded')`),
+      db
+        .select({ payment: payments, userName: users.name })
+        .from(payments)
+        .leftJoin(users, eq(payments.userId, users.id))
+        .where(where)
+        .orderBy(desc(payments.createdAt))
+        .limit(limit)
+        .offset(offset),
+    ]);
+    const total = Number(countResult?.count ?? 0);
+    const pages = Math.ceil(total / limit) || 1;
+
+    const items = rows.map((r) => ({
+      ...serializePayment(r.payment),
+      userId: r.payment.userId,
+      userName: r.userName,
+      email: r.payment.email,
+    }));
+
+    return sendSuccess(
+      res,
+      200,
+      { items, pagination: { total, page, limit, pages }, collected: Number(totals?.collected ?? 0) },
+      'Payments fetched successfully'
+    );
+  } catch (error) {
+    console.error('Error fetching admin payments:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to fetch payments' });
+  }
+});
+
+// POST /admin/payments/:id/refund — full refund of whatever hasn't been
+// refunded yet, through Razorpay, then removes the Pro year it bought.
+router.post('/admin/payments/:id/refund', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const id = String(req.params.id);
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 200) : '';
+
+    const [row] = await db.select().from(payments).where(eq(payments.id, id)).limit(1);
+    if (!row) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Payment not found' });
+    if (!row.paymentId || (row.status !== 'paid' && row.status !== 'partially_refunded')) {
+      return sendError(res, 409, { code: 'NOT_REFUNDABLE', message: `A ${row.status} payment can't be refunded` });
+    }
+
+    const remaining = row.amount - row.amountRefunded;
+    const refund = await refundPayment(row.paymentId, { reason: reason || 'Refund issued from admin panel', adminId: req.user!.userId }, remaining);
+    const after = await markRefunded(row.paymentId, row.amountRefunded + refund.amount, refund.id, req.user!.userId);
+
+    return sendSuccess(res, 200, { payment: after ? serializePayment(after) : null }, 'Refund issued');
+  } catch (error) {
+    console.error('Error refunding payment:', error);
+    if (error instanceof RazorpayError) {
+      return sendError(res, 502, { code: 'PAYMENT_PROVIDER_ERROR', message: `Razorpay: ${error.message}` });
+    }
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to refund payment' });
   }
 });
 

@@ -13,7 +13,7 @@ import { sendError } from './response.js';
  * least one of these is still running, and the one that ends last wins:
  *   - admin          users.isPro, valid until users.proUntil (granted from the admin panel)
  *   - early_access   TERM_MONTHS.early_access from activation, if activated before early access ended
- *   - (subscription) a paid Razorpay period, once billing is built
+ *   - paid           users.paidProUntil, set by a Razorpay payment (see routes/billing.ts)
  * When none is running, the account is on Free.
  */
 
@@ -30,8 +30,12 @@ export const FREE_ANALYTICS_MONTHS = 12;
 export const TERM_MONTHS = {
   early_access: 6,
   admin: 6,
-  subscription: 12,
+  paid: 12,
 } as const;
+
+/** What one paid year of Pro costs, in paise (₹799, GST not charged). */
+export const PRO_PRICE_PAISE = 79_900;
+export const PRO_CURRENCY = 'INR';
 
 /** `from` plus a number of calendar months (UTC). */
 export function addMonths(from: Date, months: number): Date {
@@ -89,11 +93,16 @@ export async function isEarlyAccessOpen(now = new Date()): Promise<boolean> {
   return !end || now < end;
 }
 
-export type PlanUser = { isPro: boolean; proUntil: Date | null; activatedAt: Date | null };
+export type PlanUser = {
+  isPro: boolean;
+  proUntil: Date | null;
+  activatedAt: Date | null;
+  paidProUntil: Date | null;
+};
 
 export type PlanTier = 'free' | 'pro';
 /** Where a Pro term comes from. `null` means plain Free. */
-export type PlanSource = 'admin' | 'early_access' | null;
+export type PlanSource = 'paid' | 'admin' | 'early_access' | null;
 
 export interface Plan {
   tier: PlanTier;
@@ -132,6 +141,7 @@ const UNDATED = new Date(8.64e15);
 /** Pure plan resolution, for callers that already hold the end date (lists). */
 export function resolvePlan(user: PlanUser, end: Date | null, now = new Date()): Plan {
   const terms: { source: Exclude<PlanSource, null>; until: Date }[] = [];
+  if (user.paidProUntil) terms.push({ source: 'paid', until: user.paidProUntil });
   if (user.isPro) terms.push({ source: 'admin', until: user.proUntil ?? UNDATED });
   const earlyBird = earlyBirdUntil(user, end);
   if (earlyBird) terms.push({ source: 'early_access', until: earlyBird });
@@ -157,7 +167,7 @@ export async function hasPro(user: PlanUser): Promise<boolean> {
 
 export async function isProUser(userId: string): Promise<boolean> {
   const [row] = await db
-    .select({ isPro: users.isPro, proUntil: users.proUntil, activatedAt: users.activatedAt })
+    .select({ isPro: users.isPro, proUntil: users.proUntil, activatedAt: users.activatedAt, paidProUntil: users.paidProUntil })
     .from(users)
     .where(eq(users.id, userId))
     .limit(1);

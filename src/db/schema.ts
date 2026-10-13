@@ -31,7 +31,8 @@ export const users = pgTable('users', {
   preferredCurrency: text('preferred_currency').notNull().default('INR'),
   /** Free text, same convention as `projects.status`/`feedback.type` — 'user' | 'admin' today. */
   role: text('role').notNull().default('user'),
-  invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id),
+  /** Who first added this person. Cleared, not cascaded, if the inviter's account is deleted. */
+  invitedBy: uuid('invited_by').references((): AnyPgColumn => users.id, { onDelete: 'set null' }),
   firstLogin: smallint('first_login').default(1).notNull(),
   isVerified: boolean('is_verified').default(false).notNull(),
   /** Membership tier, admin-controlled — no self-serve or payment flow behind this yet. */
@@ -42,6 +43,12 @@ export const users = pgTable('users', {
    * `isPro` is still true. Null only on grants made before dates existed.
    */
   proUntil: timestamp('pro_until', { withTimezone: true }),
+  /**
+   * End of the paid Pro term bought through Razorpay. Each payment adds 12
+   * months on top of whatever term was running, and a refund takes its months
+   * back off. Denormalised from `payments` so plan checks stay a single-row read.
+   */
+  paidProUntil: timestamp('paid_pro_until', { withTimezone: true }),
   /**
    * When the account first became usable, i.e. a password was first set
    * (direct signup, claiming a crew invite, or an admin setting one). Null for
@@ -202,3 +209,50 @@ export const appSettings = pgTable('app_settings', {
   value: text('value'),
   updatedAt: updatedAt(),
 });
+
+/**
+ * One row per Razorpay order: the full history of every payment attempt, and
+ * what a refund needs. Amounts are in paise (smallest unit), unlike the
+ * project money columns, because that's what Razorpay sends and refunds take.
+ *
+ * Status moves created → paid → refunded (or partially_refunded); a failed
+ * attempt marks it `failed`, and a later successful attempt on the same order
+ * can still move it to `paid`. Every transition is a conditional UPDATE, so the
+ * checkout callback and the webhook can both arrive and only one applies.
+ */
+export const payments = pgTable('payments', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  /** Kept as null if the account is deleted, so the money trail survives. */
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'set null' }),
+  /** Snapshot at order time, for the same reason. */
+  email: text('email').notNull(),
+  provider: text('provider').notNull().default('razorpay'),
+  /** Razorpay order id (order_XXX). */
+  orderId: text('order_id').notNull().unique(),
+  /** Razorpay payment id (pay_XXX) of the attempt that succeeded, or the last one that failed. */
+  paymentId: text('payment_id').unique(),
+  amount: integer('amount').notNull(),
+  currency: text('currency').notNull().default('INR'),
+  /** 'created' | 'paid' | 'failed' | 'refunded' | 'partially_refunded' */
+  status: text('status').notNull().default('created'),
+  /** upi | card | netbanking | wallet | … as Razorpay reports it. */
+  method: text('method'),
+  /** The Pro term this payment bought. Set when it's marked paid. */
+  periodStart: timestamp('period_start', { withTimezone: true }),
+  periodEnd: timestamp('period_end', { withTimezone: true }),
+  paidAt: timestamp('paid_at', { withTimezone: true }),
+  failureReason: text('failure_reason'),
+  refundId: text('refund_id'),
+  /** Total refunded so far, in paise. */
+  amountRefunded: integer('amount_refunded').notNull().default(0),
+  refundedAt: timestamp('refunded_at', { withTimezone: true }),
+  /** Who issued the refund: an admin's user id, or null when it came from the Razorpay dashboard. */
+  refundedBy: uuid('refunded_by').references(() => users.id, { onDelete: 'set null' }),
+  /** The latest payment entity from Razorpay, verbatim, for support and audits. */
+  raw: jsonb('raw'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: updatedAt(),
+}, (table) => [
+  index('payments_user_created_idx').on(table.userId, table.createdAt),
+  index('payments_status_idx').on(table.status),
+]);

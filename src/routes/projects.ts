@@ -1,11 +1,24 @@
 import { Router, Response } from 'express';
 import crypto from 'crypto';
 import { eq, and, or, asc, desc, inArray, ne, gte, lte, like, sql } from 'drizzle-orm';
+import type { BatchItem } from 'drizzle-orm/batch';
 import { db } from '../db/index.js';
 import { projects, shootDays, shootMembers, expenses, users, teamMembers, shootMilestones } from '../db/schema.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { sendInvitationEmail } from '../utils/email.js';
+import { invitesByAccount } from '../middleware/rateLimit.js';
+import {
+  MONEY_MESSAGE,
+  isDateString,
+  isOptionalText,
+  isPaymentStatus,
+  parseLimit,
+  parseMoney,
+  parsePage,
+  validateShootDay,
+  type ShootDayValue,
+} from '../utils/validate.js';
 import {
   isProUser,
   countOwnedProjects,
@@ -16,6 +29,95 @@ import {
 } from '../utils/plan.js';
 
 const router = Router();
+
+/** The business pipeline. `projects.status` is free text in the DB; the API keeps it to these. */
+const PROJECT_STATUSES = ['inquiry', 'booked', 'paid'];
+const EXPENSE_CATEGORIES = ['equipment', 'travel', 'food', 'props', 'venue', 'misc'];
+const MAX_SHOOT_DAYS = 60;
+/** Crew emails per request; the per-account daily cap is in middleware/rateLimit.ts. */
+const MAX_INVITES_PER_REQUEST = 20;
+
+/** Title/client/notes/icon checks shared by create, update and the bulk edit route. */
+function validateProjectFields(body: Record<string, unknown>, { partial }: { partial: boolean }) {
+  const fields: Record<string, string> = {};
+  const { title, client, status, budget, icon, notes, productionStage } = body;
+  const need = (v: unknown) => !partial || v !== undefined;
+
+  if (need(title) && (typeof title !== 'string' || !title.trim() || title.length > 200)) fields.title = 'Title is required (up to 200 characters)';
+  if (need(client) && (typeof client !== 'string' || !client.trim() || client.length > 200)) fields.client = 'Client name is required (up to 200 characters)';
+  if (need(budget) && parseMoney(budget) === null) fields.budget = MONEY_MESSAGE;
+  if (status !== undefined && status !== '' && !PROJECT_STATUSES.includes(status as string)) fields.status = 'Status must be inquiry, booked or paid';
+  if (!isOptionalText(icon, 16)) fields.icon = 'Icon is invalid';
+  if (!isOptionalText(notes)) fields.notes = 'Notes must be text up to 5000 characters';
+  if (productionStage !== undefined && (typeof productionStage !== 'string' || !productionStage.trim() || productionStage.length > 50)) {
+    fields.productionStage = 'Stage cannot be empty';
+  }
+  return fields;
+}
+
+/** Column values for a project update, from an already-validated body. */
+function projectUpdateValues(body: Record<string, unknown>) {
+  const { title, client, status, budget, icon, notes, productionStage } = body;
+  return {
+    ...(title !== undefined && { title: (title as string).trim() }),
+    ...(client !== undefined && { client: (client as string).trim() }),
+    ...(status !== undefined && status !== '' && { status: status as string }),
+    ...(budget !== undefined && { budget: parseMoney(budget)! }),
+    ...(icon !== undefined && { icon: (icon as string | null) || null }),
+    ...(notes !== undefined && { notes: typeof notes === 'string' ? notes.trim() : null }),
+    ...(productionStage !== undefined && { productionStage: (productionStage as string).trim() }),
+  };
+}
+
+function validateExpense(body: Record<string, unknown>, prefix = '') {
+  const fields: Record<string, string> = {};
+  const { label, amount, category, date } = body;
+  if (typeof label !== 'string' || !label.trim() || label.length > 200) fields[`${prefix}label`] = 'Label is required (up to 200 characters)';
+  if (parseMoney(amount, { allowZero: false }) === null) fields[`${prefix}amount`] = 'Enter a whole amount greater than 0';
+  if (category !== undefined && category !== null && category !== '' && !EXPENSE_CATEGORIES.includes(category as string)) fields[`${prefix}category`] = 'Invalid category';
+  if (date !== undefined && date !== null && date !== '' && !isDateString(date)) fields[`${prefix}date`] = 'Date must be YYYY-MM-DD';
+  return fields;
+}
+
+function expenseValues(projectId: string, body: Record<string, unknown>) {
+  return {
+    projectId,
+    label: (body.label as string).trim(),
+    amount: parseMoney(body.amount, { allowZero: false })!,
+    category: (body.category as string) || 'misc',
+    date: isDateString(body.date) ? body.date : null,
+  };
+}
+
+function validateMilestone(body: Record<string, unknown>, prefix = '') {
+  const fields: Record<string, string> = {};
+  const { stage, note, date } = body;
+  if (typeof stage !== 'string' || !stage.trim() || stage.length > 50) fields[`${prefix}stage`] = 'Stage is required';
+  if (!isDateString(date)) fields[`${prefix}date`] = 'Date must be YYYY-MM-DD';
+  if (typeof note !== 'string' || !note.trim() || note.length > 1000) fields[`${prefix}note`] = 'Note is required (up to 1000 characters)';
+  return fields;
+}
+
+/** Fee / paid / invited for a crew row. `invited` must be a real boolean. */
+function validateMemberFields(body: Record<string, unknown>, prefix = '') {
+  const fields: Record<string, string> = {};
+  if (body.payment !== undefined && parseMoney(body.payment) === null) fields[`${prefix}payment`] = MONEY_MESSAGE;
+  if (body.paymentStatus !== undefined && !isPaymentStatus(body.paymentStatus)) fields[`${prefix}paymentStatus`] = 'Payment status must be paid or unpaid';
+  if (body.invited !== undefined && typeof body.invited !== 'boolean') fields[`${prefix}invited`] = 'invited must be true or false';
+  return fields;
+}
+
+function memberUpdateValues(body: Record<string, unknown>) {
+  return {
+    ...(body.payment !== undefined && { payment: parseMoney(body.payment)! }),
+    ...(body.paymentStatus !== undefined && { paymentStatus: body.paymentStatus as string }),
+    ...(body.invited !== undefined && { invited: body.invited as boolean }),
+  };
+}
+
+function validationError(res: Response, fields: Record<string, string>) {
+  return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
+}
 
 /** A stable, URL-safe opaque token for the public share link. */
 function generateShareToken(): string {
@@ -228,7 +330,17 @@ function shapeTeamMember(t: {
 }
 
 // Apply auth middleware to all project routes
-router.use(requireAuth);
+router.use(['/projects', '/search', '/team-members'], requireAuth);
+
+// Every id in these paths is a uuid column; anything else can't exist.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
+for (const param of ['id', 'projectId', 'dayId', 'expenseId', 'milestoneId', 'memberId']) {
+  router.param(param, (_req, res, next, value) => {
+    if (!isUuid(value)) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Not found' });
+    next();
+  });
+}
 
 // GET /search?q= — unified search across shoots, crew (circle), and clients.
 // One bundled endpoint (rather than three client-side calls) so the frontend
@@ -705,10 +817,12 @@ router.get('/projects/earnings-history', async (req: AuthenticatedRequest, res: 
     const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
 
     // 1. Fetch owned projects (with optional search)
+    // Inquiries are unconfirmed leads, not earnings: excluded here exactly as
+    // in /projects/analytics, so the two pages always agree.
     const allOwnedProjects = await db
       .select()
       .from(projects)
-      .where(eq(projects.ownerId, userId));
+      .where(and(eq(projects.ownerId, userId), ne(projects.status, 'inquiry')));
 
     // 2. Fetch member projects
     const allMemberRows = await db
@@ -720,7 +834,7 @@ router.get('/projects/earnings-history', async (req: AuthenticatedRequest, res: 
       })
       .from(shootMembers)
       .innerJoin(projects, eq(shootMembers.projectId, projects.id))
-      .where(eq(shootMembers.userId, userId));
+      .where(and(eq(shootMembers.userId, userId), ne(projects.status, 'inquiry')));
 
     // 3. Fetch last shoot day for all relevant project IDs
     const allProjectIds = [
@@ -874,79 +988,69 @@ router.get('/projects/earnings-history', async (req: AuthenticatedRequest, res: 
   }
 });
 
-// POST /projects — create project + shoot days atomically
+// POST /projects — create project + shoot days atomically. The Free-plan
+// check, the project and its days are one transaction under a per-owner lock,
+// so two shoots created at the same moment can't both slip under the limit.
 router.post('/projects', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    const { title, client, status, budget, icon, notes, shootDays: inputDays } = req.body;
-
-    // ── Validation ────────────────────────────────────────────────────────
-    const fields: Record<string, string> = {};
-    if (!title || typeof title !== 'string' || !title.trim())
-      fields.title = 'Title is required';
-    if (!client || typeof client !== 'string' || !client.trim())
-      fields.client = 'Client name is required';
-    if (budget === undefined || budget === null || isNaN(Number(budget)) || Number(budget) < 0)
-      fields.budget = 'A valid budget amount is required';
-    if (!Array.isArray(inputDays) || inputDays.length === 0)
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const fields = validateProjectFields(body, { partial: false });
+    const inputDays = body.shootDays;
+    const days: ShootDayValue[] = [];
+    if (!Array.isArray(inputDays) || inputDays.length === 0) {
       fields.shootDays = 'At least one shoot day is required';
-    else
-      (inputDays as Array<{ date: string; time?: string; locationName?: string; notes?: string }>).forEach((day, i) => {
-        if (!day.date) fields[`shootDays[${i}].date`] = `Shoot day ${i + 1}: date is required`;
-      });
-
-    if (Object.keys(fields).length > 0) {
-      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
-    }
-
-    // ── Plan gate ─────────────────────────────────────────────────────────
-    // A cap on creation: every shoot the account has ever made counts, in any
-    // status. Deleting one frees a slot; marking it paid does not.
-    if (!(await isProUser(userId))) {
-      const owned = await countOwnedProjects(userId);
-      if (owned >= FREE_SHOOT_LIMIT) {
-        return sendProRequired(
-          res,
-          `Free covers ${FREE_SHOOT_LIMIT} shoots. Upgrade to Pro to create unlimited shoots.`
+    } else if (inputDays.length > MAX_SHOOT_DAYS) {
+      fields.shootDays = `A shoot can have up to ${MAX_SHOOT_DAYS} days`;
+    } else {
+      inputDays.forEach((raw, i) => {
+        const day = (raw ?? {}) as Record<string, unknown>;
+        const checked = validateShootDay(
+          { date: day.date, time: day.time, locationJSON: { name: day.locationName ?? '' }, eventTitle: day.notes },
+          `shootDays[${i}].`,
         );
-      }
+        if (checked.ok) days.push(checked.value);
+        else Object.assign(fields, checked.fields);
+      });
+    }
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
+
+    const pro = await isProUser(userId);
+    const projectId = crypto.randomUUID();
+    const values = projectUpdateValues(body);
+    const underLimit = pro
+      ? sql`TRUE`
+      : sql`(SELECT count(*) FROM projects WHERE owner_id = ${userId}::uuid) < ${FREE_SHOOT_LIMIT}`;
+    const dayRows = sql.join(
+      days.map((d, i) => sql`(${projectId}::uuid, ${d.date}, ${d.time}, ${JSON.stringify(d.locationJSON)}::jsonb, ${i + 1}::int, ${d.eventTitle})`),
+      sql`, `,
+    );
+
+    const [, created] = await db.batch([
+      db.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`projects:${userId}`}))`),
+      db.execute(sql`
+        INSERT INTO projects (id, owner_id, title, client, status, budget, icon, notes)
+        SELECT ${projectId}::uuid, ${userId}::uuid, ${values.title!}, ${values.client!}, ${values.status ?? 'inquiry'},
+               ${values.budget!}, ${values.icon ?? null}, ${values.notes ?? null}
+        WHERE ${underLimit}
+        RETURNING id`),
+      db.execute(sql`
+        INSERT INTO shoot_days (project_id, date, time, location_json, shoot_order, event_title)
+        SELECT * FROM (VALUES ${dayRows}) AS v(project_id, date, time, location_json, shoot_order, event_title)
+        WHERE EXISTS (SELECT 1 FROM projects WHERE id = ${projectId}::uuid)`),
+    ]);
+
+    if (created.rows.length === 0) {
+      return sendProRequired(res, `Free covers ${FREE_SHOOT_LIMIT} shoots. Upgrade to Pro to create unlimited shoots.`);
     }
 
-    // ── Insert project ────────────────────────────────────────────────────
-    const [newProject] = await db
-      .insert(projects)
-      .values({
-        ownerId: userId,
-        title: title.trim(),
-        client: client.trim(),
-        status: status || 'inquiry',
-        budget: Number(budget),
-        icon: icon ?? null,
-        notes: notes?.trim() ?? null,
-      })
-      .returning();
-
-    // ── Insert shoot days ─────────────────────────────────────────────────
-    const dayValues = (inputDays as Array<{ date: string; time?: string; locationName?: string; locationJSON?: object; shootOrder?: number; notes?: string }>).map((day, i) => ({
-      projectId: newProject.id,
-      date: day.date as string,
-      time: (day.time ?? '') as string,
-      locationJSON: {
-        name: (day.locationName ?? '') as string,
-        ...(day.locationName
-          ? { mapsUrl: `https://maps.google.com/?q=${encodeURIComponent(day.locationName)}` }
-          : {}),
-      },
-      shootOrder: i + 1,
-      eventTitle: (day.notes ?? null) as string | null,
-    }));
-
-    const insertedDays = await db.insert(shootDays).values(dayValues).returning();
-
-    // ── Fetch owner name & email ──────────────────────────────────────────
-    const [owner] = await db.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, userId)).limit(1);
+    const [[newProject], insertedDays, [owner]] = await Promise.all([
+      db.select().from(projects).where(eq(projects.id, projectId)).limit(1),
+      db.select().from(shootDays).where(eq(shootDays.projectId, projectId)).orderBy(asc(shootDays.shootOrder)),
+      db.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, userId)).limit(1),
+    ]);
 
     return sendSuccess(
       res,
@@ -1025,8 +1129,8 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     // Parse pagination parameters
-    const limit = parseInt(req.query.limit as string, 10) || 50;
-    const page = parseInt(req.query.page as string, 10) || 1;
+    const limit = parseLimit(req.query.limit, 50);
+    const page = parsePage(req.query.page);
     const offset = (page - 1) * limit;
 
     const baseConditions = [
@@ -1318,33 +1422,13 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
     const id = String(req.params.id);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    const { title, client, status, budget, icon, notes, productionStage } = req.body;
-
-    // Validate required fields
-    const fields: Record<string, string> = {};
-    if (title !== undefined && (!title || typeof title !== 'string' || !title.trim()))
-      fields.title = 'Title cannot be empty';
-    if (client !== undefined && (!client || typeof client !== 'string' || !client.trim()))
-      fields.client = 'Client cannot be empty';
-    if (budget !== undefined && (isNaN(Number(budget)) || Number(budget) < 0))
-      fields.budget = 'Budget must be a valid number';
-    if (productionStage !== undefined && (!productionStage || typeof productionStage !== 'string' || !productionStage.trim()))
-      fields.productionStage = 'Stage cannot be empty';
-    if (Object.keys(fields).length > 0)
-      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const fields = validateProjectFields(body, { partial: true });
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
 
     const [updatedProject] = await db
       .update(projects)
-      .set({
-        ...(title !== undefined && { title: title.trim() }),
-        ...(client !== undefined && { client: client.trim() }),
-        ...(status !== undefined && { status }),
-        ...(budget !== undefined && { budget: Number(budget) }),
-        ...(icon !== undefined && { icon }),
-        ...(notes !== undefined && { notes: notes.trim() }),
-        ...(productionStage !== undefined && { productionStage: productionStage.trim() }),
-        updatedAt: new Date(),
-      })
+      .set({ ...projectUpdateValues(body), updatedAt: new Date() })
       .where(and(eq(projects.id, id), eq(projects.ownerId, userId)))
       .returning();
 
@@ -1435,16 +1519,11 @@ router.post('/projects/:projectId/days', async (req: AuthenticatedRequest, res: 
     const project = await requireProjectOwner(projectId, userId, res);
     if (!project) return;
 
-    const { date, time, locationJSON, shootOrder, eventTitle } = req.body;
+    const checked = validateShootDay(req.body ?? {});
+    if (!checked.ok) return validationError(res, checked.fields);
+    const shootOrder = Number.isInteger(req.body?.shootOrder) ? Math.min(Math.max(req.body.shootOrder, 1), 1000) : 1;
 
-    const [newDay] = await db.insert(shootDays).values({
-      projectId,
-      date,
-      time,
-      locationJSON: locationJSON || {},
-      shootOrder: shootOrder || 1,
-      eventTitle,
-    }).returning();
+    const [newDay] = await db.insert(shootDays).values({ projectId, ...checked.value, shootOrder }).returning();
 
     return sendSuccess(res, 201, { shootDay: newDay }, 'Shoot day created successfully');
   } catch (error) {
@@ -1464,13 +1543,11 @@ router.put('/projects/:projectId/days/:dayId', async (req: AuthenticatedRequest,
     const project = await requireProjectOwner(projectId, userId, res);
     if (!project) return;
 
-    const { date, time, locationJSON, shootOrder, eventTitle } = req.body;
+    const checked = validateShootDay(req.body ?? {});
+    if (!checked.ok) return validationError(res, checked.fields);
 
     const [updatedDay] = await db.update(shootDays)
-      .set({
-        date, time, locationJSON, shootOrder, eventTitle,
-        updatedAt: new Date()
-      })
+      .set({ ...checked.value, updatedAt: new Date() })
       .where(and(eq(shootDays.id, dayId), eq(shootDays.projectId, projectId)))
       .returning();
 
@@ -1548,28 +1625,11 @@ router.post('/projects/:projectId/expenses', async (req: AuthenticatedRequest, r
     const project = await requireProjectOwner(projectId, userId, res);
     if (!project) return;
 
-    const { label, amount, category, date } = req.body;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const fields = validateExpense(body);
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
 
-    // Validation
-    const fields: Record<string, string> = {};
-    if (!label || typeof label !== 'string' || !label.trim()) {
-      fields.label = 'Label is required';
-    }
-    if (amount === undefined || amount === null || isNaN(Number(amount)) || Number(amount) <= 0) {
-      fields.amount = 'A valid positive amount is required';
-    }
-
-    if (Object.keys(fields).length > 0) {
-      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
-    }
-
-    const [newExpense] = await db.insert(expenses).values({
-      projectId,
-      label: label.trim(),
-      amount: Number(amount),
-      category: category || 'misc',
-      date: date && typeof date === 'string' && date.trim() ? date.trim() : null,
-    }).returning();
+    const [newExpense] = await db.insert(expenses).values(expenseValues(projectId, body)).returning();
 
     const shapedExpense = {
       id: newExpense.id,
@@ -1634,14 +1694,8 @@ router.post('/projects/:projectId/milestones', async (req: AuthenticatedRequest,
     if (!project) return;
 
     const { stage, note, date } = req.body;
-
-    const fields: Record<string, string> = {};
-    if (!stage || typeof stage !== 'string' || !stage.trim()) fields.stage = 'Stage is required';
-    if (!date || typeof date !== 'string' || !date.trim()) fields.date = 'Date is required';
-    if (!note || typeof note !== 'string' || !note.trim()) fields.note = 'Note is required';
-    if (Object.keys(fields).length > 0) {
-      return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
-    }
+    const fields = validateMilestone(req.body ?? {});
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
 
     const [newMilestone] = await db.insert(shootMilestones).values({
       projectId,
@@ -1780,109 +1834,225 @@ router.post('/projects/:projectId/share/reset', async (req: AuthenticatedRequest
   }
 });
 
-// ─── Team Members / Crew Endpoints ──────────────────────────────────────────
+// ─── Bulk edit ──────────────────────────────────────────────────────────────
 
-// POST /projects/:projectId/members
-router.post('/projects/:projectId/members', async (req: AuthenticatedRequest, res: Response) => {
+// PUT /projects/:projectId/edits — everything the shoot detail screen's Save
+// changes, applied in one transaction: either all of it lands or none does.
+// New crew are added afterwards through POST /members, because that creates
+// accounts and sends emails, which can't be rolled back.
+router.put('/projects/:projectId/edits', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     const projectId = String(req.params.projectId);
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
+    const body = (req.body ?? {}) as Record<string, any>;
+    const list = (v: unknown): any[] => (Array.isArray(v) ? v : []);
+    const ids = (v: unknown, key: string, fields: Record<string, string>) => {
+      const arr = list(v);
+      if (!arr.every(isUuid)) fields[key] = 'Invalid id';
+      return arr as string[];
+    };
+
+    const fields: Record<string, string> = {};
+    const projectBody = (body.project ?? {}) as Record<string, unknown>;
+    Object.assign(fields, validateProjectFields(projectBody, { partial: true }));
+
+    const deletedDayIds = ids(body.days?.deletedIds, 'days.deletedIds', fields);
+    const dayUpserts = list(body.days?.upserts).map((d: Record<string, unknown>, i: number) => {
+      if (!d.isNew && !isUuid(d.id)) fields[`days.upserts[${i}].id`] = 'Invalid id';
+      const checked = validateShootDay(
+        { date: d.date, time: d.time, locationJSON: { name: d.locationName ?? '' }, eventTitle: d.notes },
+        `days.upserts[${i}].`,
+      );
+      if (!checked.ok) Object.assign(fields, checked.fields);
+      return { isNew: Boolean(d.isNew), id: d.id as string, value: checked.ok ? checked.value : null };
+    });
+
+    const deletedExpenseIds = ids(body.expenses?.deletedIds, 'expenses.deletedIds', fields);
+    const addedExpenses = list(body.expenses?.added) as Record<string, unknown>[];
+    addedExpenses.forEach((e, i) => Object.assign(fields, validateExpense(e ?? {}, `expenses.added[${i}].`)));
+
+    const deletedMilestoneIds = ids(body.milestones?.deletedIds, 'milestones.deletedIds', fields);
+    const addedMilestones = list(body.milestones?.added) as Record<string, unknown>[];
+    addedMilestones.forEach((m, i) => Object.assign(fields, validateMilestone(m ?? {}, `milestones.added[${i}].`)));
+
+    const deletedMemberIds = ids(body.members?.deletedIds, 'members.deletedIds', fields);
+    const updatedMembers = list(body.members?.updated) as Record<string, unknown>[];
+    updatedMembers.forEach((m, i) => {
+      if (!isUuid(m?.id)) fields[`members.updated[${i}].id`] = 'Invalid id';
+      Object.assign(fields, validateMemberFields(m ?? {}, `members.updated[${i}].`));
+    });
+
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
+
     const project = await requireProjectOwner(projectId, userId, res);
     if (!project) return;
 
-    // Fetch project owner and project shoot dates for the invitation email
-    const [owner] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    const ownerName = owner?.name || owner?.email || 'Someone';
-
-    const days = await db
-      .select({ date: shootDays.date })
-      .from(shootDays)
-      .where(eq(shootDays.projectId, projectId));
-    const shootDates = days.map((d) => d.date);
-
-    let emails: string[] = [];
-    const { email, emails: bodyEmails, payment, paymentStatus, invited } = req.body;
-
-    if (Array.isArray(bodyEmails)) {
-      emails = bodyEmails;
-    } else if (email && typeof email === 'string') {
-      emails = [email];
+    if (addedMilestones.length > 0 && !(await isProUser(userId))) {
+      return sendProRequired(res, 'The client delivery timeline is a Pro feature.');
     }
 
-    if (emails.length === 0) {
+    const now = new Date();
+    const statements: BatchItem<'pg'>[] = [];
+
+    if (deletedDayIds.length) {
+      statements.push(db.delete(shootDays).where(and(eq(shootDays.projectId, projectId), inArray(shootDays.id, deletedDayIds))));
+    }
+    const newDays = dayUpserts.filter((d) => d.isNew).map((d) => ({ projectId, ...d.value!, shootOrder: 99 }));
+    if (newDays.length) statements.push(db.insert(shootDays).values(newDays));
+    for (const d of dayUpserts.filter((d) => !d.isNew)) {
+      statements.push(
+        db.update(shootDays)
+          .set({ ...d.value!, updatedAt: now })
+          .where(and(eq(shootDays.id, d.id), eq(shootDays.projectId, projectId)))
+      );
+    }
+
+    if (deletedExpenseIds.length) {
+      statements.push(db.delete(expenses).where(and(eq(expenses.projectId, projectId), inArray(expenses.id, deletedExpenseIds))));
+    }
+    if (addedExpenses.length) statements.push(db.insert(expenses).values(addedExpenses.map((e) => expenseValues(projectId, e))));
+
+    if (deletedMilestoneIds.length) {
+      statements.push(db.delete(shootMilestones).where(and(eq(shootMilestones.projectId, projectId), inArray(shootMilestones.id, deletedMilestoneIds))));
+    }
+    if (addedMilestones.length) {
+      statements.push(db.insert(shootMilestones).values(addedMilestones.map((m) => ({
+        projectId,
+        stage: (m.stage as string).trim(),
+        note: (m.note as string).trim(),
+        date: m.date as string,
+      }))));
+    }
+    // Keep the denormalised current stage in step with the timeline, unless
+    // the client sends its own (the project update below then wins).
+    if ((deletedMilestoneIds.length || addedMilestones.length) && projectBody.productionStage === undefined) {
+      statements.push(db.execute(sql`
+        UPDATE projects
+        SET production_stage = COALESCE(
+          (SELECT stage FROM shoot_milestones WHERE project_id = ${projectId}::uuid ORDER BY created_at DESC LIMIT 1),
+          'booked')
+        WHERE id = ${projectId}::uuid`));
+    }
+
+    if (deletedMemberIds.length) {
+      statements.push(db.delete(shootMembers).where(and(eq(shootMembers.projectId, projectId), inArray(shootMembers.id, deletedMemberIds))));
+    }
+    for (const m of updatedMembers) {
+      statements.push(
+        db.update(shootMembers)
+          .set({ ...memberUpdateValues(m), updatedAt: now })
+          .where(and(eq(shootMembers.id, m.id as string), eq(shootMembers.projectId, projectId)))
+      );
+    }
+
+    statements.push(
+      db.update(projects).set({ ...projectUpdateValues(projectBody), updatedAt: now }).where(eq(projects.id, projectId))
+    );
+
+    await db.batch(statements as [BatchItem<'pg'>, ...BatchItem<'pg'>[]]);
+
+    return sendSuccess(res, 200, {}, 'Project saved');
+  } catch (error) {
+    console.error('Error saving project edits:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to save changes. Nothing was changed.' });
+  }
+});
+
+// ─── Team Members / Crew Endpoints ──────────────────────────────────────────
+
+// POST /projects/:projectId/members — add crew by email. Accepts
+// `members: [{ email, payment?, paymentStatus?, invited? }]`, or the older
+// `emails: string[]` / `email` with shared fields. Each new crew member gets
+// an invitation email, so requests are capped and rate-limited per account.
+router.post('/projects/:projectId/members', invitesByAccount, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const shared = { payment: body.payment, paymentStatus: body.paymentStatus, invited: body.invited };
+    const entries: Record<string, unknown>[] = Array.isArray(body.members)
+      ? body.members.map((m) => (m && typeof m === 'object' ? (m as Record<string, unknown>) : {}))
+      : Array.isArray(body.emails)
+        ? body.emails.map((email) => ({ email, ...shared }))
+        : typeof body.email === 'string'
+          ? [{ email: body.email, ...shared }]
+          : [];
+
+    if (entries.length === 0) {
       return sendError(res, 400, { code: 'BAD_REQUEST', message: 'Valid email or emails array is required' });
     }
+    if (entries.length > MAX_INVITES_PER_REQUEST) {
+      return sendError(res, 400, { code: 'BAD_REQUEST', message: `Add up to ${MAX_INVITES_PER_REQUEST} crew members at a time` });
+    }
+
+    const fields: Record<string, string> = {};
+    entries.forEach((m, i) => {
+      if (typeof m.email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(m.email.trim()) || m.email.length > 254) {
+        fields[`members[${i}].email`] = 'Enter a valid email address';
+      }
+      Object.assign(fields, validateMemberFields(m, `members[${i}].`));
+    });
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const [[owner], days] = await Promise.all([
+      db.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, userId)).limit(1),
+      db.select({ date: shootDays.date }).from(shootDays).where(eq(shootDays.projectId, projectId)),
+    ]);
+    const ownerName = owner?.name || owner?.email || 'Someone';
+    const shootDates = days.map((d) => d.date);
 
     const results = [];
+    const seen = new Set<string>();
 
-    for (const rawEmail of emails) {
-      if (typeof rawEmail !== 'string' || !rawEmail.includes('@')) continue;
-      const targetEmail = rawEmail.trim().toLowerCase();
+    for (const entry of entries) {
+      const targetEmail = (entry.email as string).trim().toLowerCase();
+      if (seen.has(targetEmail)) continue;
+      seen.add(targetEmail);
 
-      // 1. Search for user by email
+      // 1. Find or create the person (an unactivated placeholder until they set a password)
       let [targetUser] = await db.select().from(users).where(eq(users.email, targetEmail)).limit(1);
-
       if (!targetUser) {
-        // 1.1 Create user if not in database
-        const [newUser] = await db.insert(users).values({
-          email: targetEmail,
-          invitedBy: userId,
-        }).returning();
-        targetUser = newUser;
+        [targetUser] = await db.insert(users).values({ email: targetEmail, invitedBy: userId }).returning();
       }
 
-      // 2. Check if already a member of this project — skip before sending
-      // any email so a retried/duplicate request doesn't re-notify someone
-      // who's already on the crew.
-      const [existingMember] = await db.select().from(shootMembers).where(and(
+      // 2. Already on this crew: skip before any email, so a retry doesn't re-notify them.
+      const [existingMember] = await db.select({ id: shootMembers.id }).from(shootMembers).where(and(
         eq(shootMembers.projectId, projectId),
         eq(shootMembers.userId, targetUser.id)
       )).limit(1);
+      if (existingMember) continue;
 
-      if (existingMember) {
-        continue;
-      }
+      // 3. Add to the crew with their fee, then to the owner's circle.
+      const [newMember] = await db.insert(shootMembers).values({
+        projectId,
+        userId: targetUser.id,
+        payment: entry.payment !== undefined ? parseMoney(entry.payment)! : 0,
+        paymentStatus: entry.paymentStatus === 'paid' ? 'paid' : 'unpaid',
+        invited: typeof entry.invited === 'boolean' ? entry.invited : true,
+      }).returning();
 
-      // A crew member can be invited to multiple projects over time — a user
-      // row created by an earlier invite (or one who registered but never
-      // finished setup) still won't have a password, so this checks the real
-      // account state rather than "was this row just created right now".
-      const needsPasswordSetup = !targetUser.passwordHash;
+      await db.insert(teamMembers).values({ userId, memberId: targetUser.id }).onConflictDoNothing();
+
+      // 4. Only now that they're on the crew, tell them. A row created by an
+      // earlier invite may still have no password, so check the account itself.
       sendInvitationEmail(
         targetEmail,
         ownerName,
         project.title,
         project.client,
         shootDates,
-        needsPasswordSetup,
+        !targetUser.passwordHash,
         projectId
       ).catch((err) => {
         console.error(`Failed to send invitation email to ${targetEmail}:`, err);
       });
-
-      // 3. Map user with project
-      const [newMember] = await db.insert(shootMembers).values({
-        projectId,
-        userId: targetUser.id,
-        payment: Number(payment) || 0,
-        paymentStatus: paymentStatus === 'paid' ? 'paid' : 'unpaid',
-        invited: invited !== undefined ? invited : true,
-      }).returning();
-
-      // 4. Add to owner's teamMembers list (if not already there)
-      const [existingTeamMember] = await db.select().from(teamMembers).where(and(
-        eq(teamMembers.userId, userId),
-        eq(teamMembers.memberId, targetUser.id)
-      )).limit(1);
-
-      if (!existingTeamMember) {
-        await db.insert(teamMembers).values({
-          userId,
-          memberId: targetUser.id,
-        });
-      }
 
       results.push(shapeTeamMember({
         id: newMember.id,
@@ -1913,15 +2083,12 @@ router.put('/projects/:projectId/members/:memberId', async (req: AuthenticatedRe
     const project = await requireProjectOwner(projectId, userId, res);
     if (!project) return;
 
-    const { payment, paymentStatus, invited } = req.body;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const fields = validateMemberFields(body);
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
 
     const [updatedMember] = await db.update(shootMembers)
-      .set({
-        ...(payment !== undefined && { payment: Number(payment) }),
-        ...(paymentStatus !== undefined && { paymentStatus }),
-        ...(invited !== undefined && { invited }),
-        updatedAt: new Date()
-      })
+      .set({ ...memberUpdateValues(body), updatedAt: new Date() })
       .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId)))
       .returning();
 
@@ -1984,8 +2151,8 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
     const userId = req.user?.userId;
     if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
 
-    const datesQuery = req.query.dates as string; // comma-separated dates, e.g. "2026-07-16,2026-07-20"
-    const targetDates = datesQuery ? datesQuery.split(',').map((d) => d.trim()).filter(Boolean) : [];
+    const datesQuery = typeof req.query.dates === 'string' ? req.query.dates : ''; // e.g. "2026-07-16,2026-07-20"
+    const targetDates = datesQuery ? datesQuery.split(',').map((d) => d.trim()).filter(isDateString).slice(0, 62) : [];
 
     const rows = await db
       .select({
@@ -2000,7 +2167,7 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
       .where(eq(teamMembers.userId, userId));
 
     const memberIds = rows.map((r) => r.id);
-    let bookings: Array<{ userId: string | null; date: string; projectTitle: string }> = [];
+    let bookings: Array<{ userId: string | null; date: string; projectTitle: string; ownerId: string }> = [];
 
     if (memberIds.length > 0 && targetDates.length > 0) {
       // A circle member can be "busy" two different ways: booked as crew on
@@ -2015,6 +2182,7 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
             userId: shootMembers.userId,
             date: shootDays.date,
             projectTitle: projects.title,
+            ownerId: projects.ownerId,
           })
           .from(shootMembers)
           .innerJoin(projects, eq(shootMembers.projectId, projects.id))
@@ -2030,6 +2198,7 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
             userId: projects.ownerId,
             date: shootDays.date,
             projectTitle: projects.title,
+            ownerId: projects.ownerId,
           })
           .from(projects)
           .innerJoin(shootDays, eq(shootDays.projectId, projects.id))
@@ -2058,7 +2227,11 @@ router.get('/team-members', async (req: AuthenticatedRequest, res: Response) => 
         // comment in routes/auth.ts. So 0 → onboarded, 1 → not yet.
         firstLogin: r.firstLogin === 0,
         isAvailable: datesQuery ? isAvailable : undefined,
-        busyOn: datesQuery && !isAvailable ? userBookings.map((b) => ({ date: b.date, projectTitle: b.projectTitle })) : undefined,
+        // Only the date is shared. Someone's other bookings are their business:
+        // the title is shown only when the booking is on the viewer's own shoot.
+        busyOn: datesQuery && !isAvailable
+          ? userBookings.map((b) => (b.ownerId === userId ? { date: b.date, projectTitle: b.projectTitle } : { date: b.date }))
+          : undefined,
       };
     });
 

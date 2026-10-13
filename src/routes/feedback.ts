@@ -6,7 +6,7 @@ import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 
 const router = Router();
-router.use(requireAuth);
+router.use('/feedback', requireAuth);
 
 const FEEDBACK_TYPES = ['feedback', 'bug'] as const;
 type FeedbackType = (typeof FEEDBACK_TYPES)[number];

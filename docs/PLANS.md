@@ -6,14 +6,14 @@ this is `src/utils/plan.ts`; every Pro check on the server goes through it.
 
 **The one rule to remember: Pro is always a dated term, never permanent.**
 Free Pro (an early-bird term or an admin grant) lasts **6 months**; paid Pro
-(later, via Razorpay) lasts **12 months** for ₹799. Every term has an end
+(via Razorpay) lasts **12 months** for ₹799. Every term has an end
 date, and when it passes the account drops to Free.
 
 ## The plans
 
 | | Free | Pro |
 |---|---|---|
-| Price | ₹0, forever | ₹799 / year (no checkout yet) |
+| Price | ₹0, forever | ₹799 for 12 months, one-time (Razorpay) |
 | Shoots you create | 3 in total, any status | Unlimited |
 | Shoots you're crew on | Unlimited | Unlimited |
 | Analytics | Last 12 months | Full history |
@@ -37,7 +37,7 @@ last**. It returns `{ tier, source, proUntil, lapsed }`.
 |---|---|---|---|
 | `early_access` | Early-bird term | The day the account activated, if before early access ended | 6 months later |
 | `admin` | Admin grant | When an admin grants it | 6 months later by default, or a date the admin picks |
-| `subscription` | Paid year *(Razorpay, not built yet)* | Payment (or the end of the current term) | 12 months later |
+| `paid` | Paid year (Razorpay) | Payment, or the end of the current term if one is running | 12 months later |
 | `null` | Free | When no term is running | n/a |
 
 When nothing is running, `lapsed` says which term ended last and when, so the
@@ -49,7 +49,7 @@ admin users list shows `pro · until …`, `pro · early bird · until …`,
 `free · early bird ended …`, `free` or `invited`.
 
 Term lengths live in `TERM_MONTHS` in `plan.ts` (`early_access: 6`,
-`admin: 6`, `subscription: 12`). Change them there and the backend follows;
+`admin: 6`, `paid: 12`). Change them there and the backend follows;
 the app, admin panel and landing page copy say "6 months" in text, so update
 those too.
 
@@ -63,7 +63,6 @@ later password reset can't restart a free term.
 |---|---|
 | Signs up (verify email, set password) | `POST /auth/reset-password` |
 | Accepts a crew invite (sets password from the invite link) | `POST /auth/reset-password` |
-| Registered directly with a password | `POST /auth/register` |
 | Sets a first password from settings | `PUT /auth/me` |
 | Admin creates the account with a password, or sets one | `POST`/`PUT /admin/users` |
 | Older account signing in with no date yet (safety net) | `POST /auth/login` |
@@ -158,82 +157,63 @@ below.
 Until step 2 runs, undated admin grants keep working (treated as running) and
 accounts without `activated_at` are on Free, so run it straight after step 1.
 
-## Adding paid Pro with Razorpay
+## Paid Pro with Razorpay
 
-The plan resolver already handles several terms and picks the one that ends
-last, so a paid year is one more term. The rest is new work. Recommended shape:
+Built 2 Oct 2026. **One-time payment, no auto-renewal, no GST charged.** ₹799
+(`PRO_PRICE_PAISE = 79900` in `plan.ts`) buys 12 months. The server sets the
+price; the app only displays it.
 
 ### Data
 
-```text
-subscriptions
-  id                         uuid pk
-  user_id                    uuid → users.id
-  provider                   'razorpay'
-  provider_subscription_id   text unique        -- sub_XXXX
-  plan_code                  'pro_yearly'
-  status                     text               -- mirrors Razorpay status
-  current_period_start       timestamptz
-  current_period_end         timestamptz
-  cancel_at_period_end       boolean
-  created_at / updated_at
+- `payments`: one row per Razorpay order, kept forever (survives account
+  deletion via `user_id → set null` plus an `email` snapshot). Holds order,
+  payment and refund ids, amount in paise, method, status, the Pro period it
+  bought, who refunded it, and the raw Razorpay payment entity.
+  Status: `created → paid → refunded | partially_refunded`, or `failed`
+  (a later successful attempt on the same order can still become `paid`).
+- `users.paid_pro_until`: end of the paid term, denormalised so plan checks
+  stay a single-row read. `resolvePlan` treats it as the `paid` source.
 
-payment_events
-  event_id                   text pk            -- X-Razorpay-Event-Id, for idempotency
-  type                       text
-  payload                    jsonb
-  received_at                timestamptz
-```
+### Flow (`src/routes/billing.ts`, `src/utils/billing.ts`)
 
-### Entitlement
+1. `POST /billing/orders` creates a Razorpay order for ₹799 and a `created`
+   row. An unpaid order from the last 30 minutes is reused.
+2. The app (`/settings/billing`, `ProCheckoutButton`) opens Razorpay Checkout.
+3. `POST /billing/verify` checks the HMAC signature, fetches the payment from
+   Razorpay, captures it if only authorised, and marks it paid.
+4. `POST /billing/webhook` (raw body, `X-Razorpay-Signature`) handles
+   `payment.captured` / `order.paid` (grant), `payment.failed`, and
+   `refund.created` / `refund.processed` (refunds made in the dashboard too).
 
-Add a `subscription` term to `resolvePlan`, ending at `current_period_end`,
-while `status` is `active` (or `authenticated` / `pending` within a short
-grace window). Keep it in `plan.ts` so every gate (shoot limit, analytics,
-timeline, share-link branding) picks it up with no other changes.
+Steps 3 and 4 usually both happen. Every state change is one SQL statement
+guarded by the row's current status, so a payment or refund is applied once.
 
-**Paying before free Pro ends.** Start the paid year where the current
-term ends, not on the payment date, so nobody loses the free months they have
-left. For a Razorpay Subscription, set `start_at` to the current `proUntil`;
-for a one-off yearly payment, set the new period's end to
-`max(now, proUntil) + 12 months`.
+**Stacking.** The paid year starts at the latest of: now, the end of any
+running admin or early-bird term, and the current `paid_pro_until`. Paying
+early never loses days.
 
-### Flow
+**Refunds.** *Admin → Payments → Refund* refunds whatever hasn't been
+refunded yet through Razorpay, then takes the payment's months back off
+`paid_pro_until` (later stacked payments move earlier by the same amount). A
+partial refund from the dashboard is recorded but leaves Pro alone. The
+published policy (bnwapphub.com/shoots/refund) promises a full refund within
+7 days; the admin button warns when a payment is older than that.
 
-1. One-time setup: create a yearly Plan in Razorpay for ₹799 (amounts are in
-   paise, so `79900`). Decide first whether ₹799 includes GST.
-2. `POST /billing/subscriptions` (signed in): create a Razorpay Subscription
-   for the plan, store it as `created`, return its id.
-3. The app opens Razorpay Checkout with that subscription id.
-4. On success, the app sends `razorpay_payment_id`, `razorpay_subscription_id`
-   and `razorpay_signature` to `POST /billing/subscriptions/verify`. The server
-   checks the HMAC-SHA256 signature with the key secret before trusting it.
-5. Webhooks are the source of truth: `POST /billing/razorpay/webhook` verifies
-   `X-Razorpay-Signature` against the **raw** request body with the webhook
-   secret, skips event ids already in `payment_events`, then updates the
-   subscription: `subscription.activated` / `subscription.charged` extend
-   `current_period_end`; `subscription.halted`, `subscription.cancelled` and
-   `subscription.completed` end it at the period end.
+### Setup
 
-### Things to get right
+- Env (backend only): `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`,
+  `RAZORPAY_WEBHOOK_SECRET`. Without the keys, `/billing/orders` answers
+  `503 BILLING_UNAVAILABLE`. Use test keys until KYC is approved.
+- Razorpay dashboard → Webhooks: `https://<backend>/api/v1/billing/webhook`,
+  events `payment.captured`, `payment.failed`, `order.paid`,
+  `refund.created`, `refund.processed`, with the webhook secret above.
+- Migration `drizzle/0013_payments.sql` (one new table, one nullable column).
+  Apply it with `psql` or the Neon SQL editor, not `db:push` (see the
+  warning above).
+- CSP: `shoots-app/src/proxy.ts` allows `https://*.razorpay.com` for scripts,
+  frames, images and connections on `/settings/billing` only.
 
-- **Raw body.** `src/index.ts` applies `express.json()` globally. Mount the
-  webhook route with `express.raw({ type: 'application/json' })` *before*
-  that, or the signature check will always fail.
-- **Renewal reminders.** `proDaysLeft` is already on `/auth/me`, and the plan
-  page warns in the last 30 days. Add emails 30 and 7 days before `proUntil`
-  once checkout exists, so early birds can pay before dropping to Free.
-- **Paid term length.** `TERM_MONTHS.subscription` (12) is what a paid term
-  should use; don't reuse the 6-month free terms for it.
-- **Don't double-sell.** Someone with a running term can pay early (the paid
-  year stacks after it, see above), but don't let them start two
-  subscriptions at once.
-- **Secrets.** `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` and
-  `RAZORPAY_WEBHOOK_SECRET` go in the backend env only. Use test-mode keys
-  until launch.
-- **Legal pages.** Terms section 7 and the Privacy Policy say no billing is
-  running and no payment data is collected. Update both, name Razorpay as a
-  processor, and decide on a refund and cancellation policy before launch.
-- **App UI.** The plan page (`shoots-app/src/app/settings/billing`) is
-  read-only today. It needs an Upgrade button for Free and expiring accounts,
-  and a "renews on / cancel" view for subscribers.
+### Not built yet
+
+- Renewal reminder emails 30 and 7 days before `proUntil`.
+- Invoices/receipts beyond Razorpay's own payment email.

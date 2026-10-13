@@ -14,14 +14,22 @@ import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { countOwnedProjects, FREE_SHOOT_LIMIT, getEarlyAccessEnd, markActivated, resolvePlan } from '../utils/plan.js';
 import { sendPasswordResetEmail, sendSignupVerificationEmail } from '../utils/email.js';
+import {
+  emailSendByAddress,
+  emailSendByIp,
+  loginByEmail,
+  loginByIp,
+  tokenCheckByIp,
+} from '../middleware/rateLimit.js';
 
 const router = Router();
 
 type UserRow = typeof users.$inferSelect;
 
 /**
- * Shapes a raw `users` row for API responses: strips the password hash and
- * converts the `first_login` smallint column to a proper JSON boolean.
+ * Shapes a raw `users` row for API responses: strips every credential (the
+ * password hash and any live reset/verification token, which is as good as
+ * the password while it lasts) and converts the `first_login` smallint column to a proper JSON boolean.
  *
  * IMPORTANT — the column defaults to 1 for every newly created account
  * (both self-registered and auto-created-via-invite), meaning "this
@@ -31,7 +39,7 @@ type UserRow = typeof users.$inferSelect;
  * and every brand-new account reports as already onboarded.
  */
 export function serializeUser(user: UserRow) {
-  const { passwordHash: _passwordHash, firstLogin, ...rest } = user;
+  const { passwordHash: _passwordHash, resetToken: _resetToken, resetTokenExpiry: _resetTokenExpiry, firstLogin, ...rest } = user;
   return { ...rest, firstLogin: firstLogin === 0 };
 }
 
@@ -63,98 +71,21 @@ async function revokeAllSessions(userId: string) {
     .where(and(eq(refreshSessions.userId, userId), isNull(refreshSessions.revokedAt)));
 }
 
-// Helper to set refresh token cookie
+// The refresh cookie is always HTTPS-only and cross-site (the app and API are
+// on different domains). Browsers treat http://localhost as secure, so this
+// works in local development too.
+const REFRESH_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'none' as const,
+};
+
 const setRefreshTokenCookie = (res: Response, token: string) => {
-  const isProd = process.env.NODE_ENV === 'production';
   res.cookie('refreshToken', token, {
-    httpOnly: true,
-    secure: isProd,                       // HTTPS only in prod
-    sameSite: isProd ? 'none' : 'lax',   // 'none' allows cross-site in prod (Vercel → Render)
+    ...REFRESH_COOKIE_OPTIONS,
     maxAge: 60 * 24 * 60 * 60 * 1000,   // 60 days in ms
   });
 };
-
-// POST /auth/register
-router.post('/auth/register', async (req, res) => {
-  console.log(`[POST] /auth/register request received for email: ${req.body?.email}`);
-  try {
-    const { name, email, password, businessName, invitedBy } = req.body;
-
-    // 1. Validation
-    const fields: Record<string, string> = {};
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      fields.name = 'Name is required';
-    }
-    if (!email || typeof email !== 'string' || !email.trim()) {
-      fields.email = 'Email is required';
-    }
-    // Password is optional; validate only if provided
-    if (password !== undefined && password !== null) {
-      if (typeof password !== 'string' || password.length < 8) {
-        fields.password = 'Password must be at least 8 characters';
-      }
-    }
-
-    if (Object.keys(fields).length > 0) {
-      return sendError(res, 400, {
-        code: 'VALIDATION_ERROR',
-        message: 'Validation failed',
-        fields,
-      });
-    }
-
-    const cleanEmail = email.trim().toLowerCase();
-
-    // 2. Check if user already exists
-    const [existingUser] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, cleanEmail))
-      .limit(1);
-
-    if (existingUser) {
-      return sendError(res, 409, {
-        code: 'CONFLICT',
-        message: 'An account with this email already exists',
-      });
-    }
-
-    // 3. Hash password (if provided) & prepare data
-    const passwordHash = password ? await hashPassword(password) : null;
-
-    // 4. Insert user
-    const [newUser] = await db
-      .insert(users)
-      .values({
-        name: name.trim(),
-        email: cleanEmail,
-        passwordHash,
-        // No password means a placeholder (e.g. a crew invite): not activated yet.
-        activatedAt: passwordHash ? new Date() : null,
-        businessName: businessName?.trim() || null,
-        invitedBy: invitedBy || null,
-      })
-      .returning();
-
-    // 5. Generate tokens
-    const { accessToken, refreshToken } = await issueSessionTokens(newUser);
-
-    // 6. Set cookie & return response
-    setRefreshTokenCookie(res, refreshToken);
-
-    return sendSuccess(res, 201, {
-      user: serializeUser(newUser),
-      accessToken,
-      refreshToken,
-    }, 'User registered successfully');
-  } catch (error) {
-    console.error('Registration error:', error);
-    return sendError(res, 500, {
-      code: 'INTERNAL_SERVER_ERROR',
-      message: 'An unexpected error occurred during registration',
-    });
-  }
-});
 
 // POST /auth/signup-request — step 1 of the email-first signup flow: check
 // the email, and if it can't sign in yet, (re)send a verify-and-set-password
@@ -162,7 +93,7 @@ router.post('/auth/register', async (req, res) => {
 // forgot-password — a crew member invited before ever signing up already
 // goes through this same "no password yet, click a link to set one" path,
 // so this just reuses that instead of building parallel plumbing.
-router.post('/auth/signup-request', async (req, res) => {
+router.post('/auth/signup-request', emailSendByIp, emailSendByAddress, async (req, res) => {
   console.log(`[POST] /auth/signup-request request received for email: ${req.body?.email}`);
   try {
     const { email } = req.body;
@@ -232,7 +163,7 @@ router.post('/auth/signup-request', async (req, res) => {
 });
 
 // POST /auth/login
-router.post('/auth/login', async (req, res) => {
+router.post('/auth/login', loginByIp, loginByEmail, async (req, res) => {
   console.log(`[POST] /auth/login request received for email: ${req.body?.email}`);
   try {
     const { email, password } = req.body;
@@ -402,12 +333,7 @@ router.post('/auth/refresh', async (req, res) => {
 
 // POST /auth/logout
 router.post('/auth/logout', async (req, res) => {
-  const isProd = process.env.NODE_ENV === 'production';
-  res.clearCookie('refreshToken', {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: isProd ? 'none' : 'lax',
-  });
+  res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
 
   // Best-effort: revoke just this device's session server-side, so its refresh
   // token stops working instead of staying valid for its full 60-day lifetime.
@@ -639,7 +565,7 @@ router.put('/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
 
 
 // GET /auth/verify-reset-token
-router.get('/auth/verify-reset-token', async (req, res) => {
+router.get('/auth/verify-reset-token', tokenCheckByIp, async (req, res) => {
   try {
     const { token } = req.query;
     if (!token || typeof token !== 'string') {
@@ -687,7 +613,7 @@ router.get('/auth/verify-reset-token', async (req, res) => {
 });
 
 // POST /auth/forgot-password
-router.post('/auth/forgot-password', async (req, res) => {
+router.post('/auth/forgot-password', emailSendByIp, emailSendByAddress, async (req, res) => {
   console.log(`[POST] /auth/forgot-password request received for email: ${req.body?.email}`);
   try {
     const { email } = req.body;
@@ -755,7 +681,7 @@ router.post('/auth/forgot-password', async (req, res) => {
 });
 
 // POST /auth/reset-password
-router.post('/auth/reset-password', async (req, res) => {
+router.post('/auth/reset-password', tokenCheckByIp, async (req, res) => {
   console.log('[POST] /auth/reset-password request received');
   try {
     const { token, password, confirmPassword } = req.body;
