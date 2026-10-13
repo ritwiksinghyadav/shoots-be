@@ -3,7 +3,15 @@ import crypto from 'crypto';
 import { eq, and, or, asc, desc, inArray, ne, gte, lte, like, sql } from 'drizzle-orm';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { db } from '../db/index.js';
-import { projects, shootDays, shootMembers, expenses, users, teamMembers, shootMilestones } from '../db/schema.js';
+import { projects, shootDays, shootMembers, expenses, users, teamMembers, shootMilestones, clientPayments, crewPayouts } from '../db/schema.js';
+import {
+  memberChange,
+  recomputeMember,
+  recomputeProject,
+  shapeClientPayment,
+  shapePayout,
+  validatePaymentEntry,
+} from '../utils/money.js';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { sendSuccess, sendError } from '../utils/response.js';
 import { sendInvitationEmail } from '../utils/email.js';
@@ -107,14 +115,6 @@ function validateMemberFields(body: Record<string, unknown>, prefix = '') {
   return fields;
 }
 
-function memberUpdateValues(body: Record<string, unknown>) {
-  return {
-    ...(body.payment !== undefined && { payment: parseMoney(body.payment)! }),
-    ...(body.paymentStatus !== undefined && { paymentStatus: body.paymentStatus as string }),
-    ...(body.invited !== undefined && { invited: body.invited as boolean }),
-  };
-}
-
 function validationError(res: Response, fields: Record<string, string>) {
   return sendError(res, 400, { code: 'VALIDATION_ERROR', message: 'Validation failed', fields });
 }
@@ -181,16 +181,9 @@ function shapeProject(
   ownerEmail: string,
   days: (typeof shootDays.$inferSelect)[],
   exps: (typeof expenses.$inferSelect)[] = [],
-  team: {
-    id: string;
-    userId: string | null;
-    name: string | null;
-    email: string | null;
-    payment: number;
-    paymentStatus: string;
-    invited: boolean;
-  }[] = [],
-  milestones: (typeof shootMilestones.$inferSelect)[] = []
+  team: TeamMemberInput[] = [],
+  milestones: (typeof shootMilestones.$inferSelect)[] = [],
+  payments: (typeof clientPayments.$inferSelect)[] = []
 ) {
   return {
     id: p.id,
@@ -201,6 +194,12 @@ function shapeProject(
     client: p.client,
     status: p.status,
     budget: p.budget,
+    /** Money in from the client so far; the rest of the budget is still due. */
+    amountReceived: p.amountReceived,
+    clientPayments: payments
+      .slice()
+      .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.getTime() - a.createdAt.getTime())
+      .map(shapeClientPayment),
     emoji: p.icon ?? '📸',
     notes: p.notes ?? '',
     category: 'editorial' as const,
@@ -231,13 +230,13 @@ function shapeProject(
  * shapeProject() output.
  */
 function maskFinancialsForViewer<
-  T extends { userId: string | null; payment: number; paymentStatus: 'paid' | 'unpaid' }
+  T extends { userId: string | null; payment: number; amountPaid: number; paymentStatus: MemberPaymentStatus }
 >(isOwner: boolean, userId: string, budget: number, team: T[]): { budget: number; team: T[] } {
   if (isOwner) return { budget, team };
   return {
     budget: 0,
     team: team.map((member) =>
-      member.userId === userId ? member : { ...member, payment: 0, paymentStatus: 'unpaid' as const }
+      member.userId === userId ? member : { ...member, payment: 0, amountPaid: 0, paymentStatus: 'unpaid' as const, payouts: [] }
     ),
   };
 }
@@ -247,6 +246,8 @@ function stripProjectForMember(project: ReturnType<typeof shapeProject>, userId:
   return {
     ...project,
     budget: 0,
+    amountReceived: 0,
+    clientPayments: [],
     expenses: [],
     // Sharing is an owner-only control — crew see the timeline but not the link/token.
     shareToken: null,
@@ -258,7 +259,9 @@ function stripProjectForMember(project: ReturnType<typeof shapeProject>, userId:
       return {
         ...member,
         payment: 0,
+        amountPaid: 0,
         paymentStatus: 'unpaid' as const,
+        payouts: [],
       };
     }),
   };
@@ -304,16 +307,23 @@ async function requireProjectOwner(
   return undefined;
 }
 
-/** Shape a shoot member row (with optional joined user fields) into the API shape. */
-function shapeTeamMember(t: {
+type MemberPaymentStatus = 'paid' | 'partial' | 'unpaid';
+
+interface TeamMemberInput {
   id: string;
   userId: string | null;
   name: string | null;
   email: string | null;
   payment: number;
+  amountPaid: number;
   paymentStatus: string;
   invited: boolean;
-}) {
+  /** Only on the single-shoot endpoint; lists carry the total, not the rows. */
+  payouts?: (typeof crewPayouts.$inferSelect)[];
+}
+
+/** Shape a shoot member row (with optional joined user fields) into the API shape. */
+function shapeTeamMember(t: TeamMemberInput) {
   const email = t.email ?? '';
   const name = t.name || null;
   return {
@@ -323,7 +333,12 @@ function shapeTeamMember(t: {
     email,
     initials: getInitials(name || email),
     payment: t.payment,
-    paymentStatus: (t.paymentStatus === 'paid' ? 'paid' : 'unpaid') as 'paid' | 'unpaid',
+    amountPaid: t.amountPaid,
+    paymentStatus: (['paid', 'partial'].includes(t.paymentStatus) ? t.paymentStatus : 'unpaid') as MemberPaymentStatus,
+    payouts: (t.payouts ?? [])
+      .slice()
+      .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.getTime() - a.createdAt.getTime())
+      .map(shapePayout),
     invited: t.invited,
     avatarColor: getAvatarColor(email),
   };
@@ -335,7 +350,7 @@ router.use(['/projects', '/search', '/team-members'], requireAuth);
 // Every id in these paths is a uuid column; anything else can't exist.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
-for (const param of ['id', 'projectId', 'dayId', 'expenseId', 'milestoneId', 'memberId']) {
+for (const param of ['id', 'projectId', 'dayId', 'expenseId', 'milestoneId', 'memberId', 'paymentId', 'payoutId']) {
   router.param(param, (_req, res, next, value) => {
     if (!isUuid(value)) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Not found' });
     next();
@@ -482,6 +497,7 @@ router.get('/projects/upcoming-days', async (req: AuthenticatedRequest, res: Res
         name: users.name,
         email: users.email,
         payment: shootMembers.payment,
+        amountPaid: shootMembers.amountPaid,
         paymentStatus: shootMembers.paymentStatus,
         invited: shootMembers.invited,
       })
@@ -582,6 +598,7 @@ router.get('/projects/shoot-days', async (req: AuthenticatedRequest, res: Respon
         name: users.name,
         email: users.email,
         payment: shootMembers.payment,
+        amountPaid: shootMembers.amountPaid,
         paymentStatus: shootMembers.paymentStatus,
         invited: shootMembers.invited,
       })
@@ -700,14 +717,26 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
         u.id AS user_id,
         LOWER(u.email) AS email,
         MAX(u.name) AS name,
-        SUM(CASE WHEN sm.payment_status = 'paid' THEN sm.payment ELSE 0 END)::integer AS total_paid,
-        SUM(CASE WHEN sm.payment_status != 'paid' THEN sm.payment ELSE 0 END)::integer AS total_unpaid
+        -- Part payments count: paid is what's gone out, owed is the rest of the fee.
+        -- A ₹0 fee marked paid by hand has nothing in either column.
+        SUM(sm.amount_paid)::integer AS total_paid,
+        SUM(GREATEST(sm.payment - sm.amount_paid, 0))::integer AS total_unpaid
       FROM shoot_members sm
       JOIN projects p ON sm.project_id = p.id
       JOIN users u ON sm.user_id = u.id
       WHERE p.owner_id = ${userId}::uuid
       GROUP BY u.id, LOWER(u.email)
     `);
+
+    // 4b. Money still to come in from clients on confirmed (non-inquiry) shoots.
+    const receivablesQuery = await db.execute(sql`
+      SELECT
+        COALESCE(SUM(amount_received), 0)::integer AS received,
+        COALESCE(SUM(GREATEST(budget - amount_received, 0)), 0)::integer AS due
+      FROM projects
+      WHERE owner_id = ${userId}::uuid AND status != 'inquiry'
+    `);
+    const receivables = (receivablesQuery.rows as unknown as { received: number; due: number }[])[0] ?? { received: 0, due: 0 };
 
     // 5. Type definitions for raw SQL query results
     interface OwnedProjectRow { project_month: string; budget: number; crew_payouts: number }
@@ -794,6 +823,9 @@ router.get('/projects/analytics', async (req: AuthenticatedRequest, res: Respons
       crewPayouts: crewPayoutsList,
       plan: pro ? 'pro' : 'free',
       analyticsWindowMonths: pro ? null : FREE_ANALYTICS_MONTHS,
+      /** Confirmed shoots: received from clients so far, and still due. */
+      clientReceived: Number(receivables.received),
+      clientDue: Number(receivables.due),
     }, 'Analytics data compiled successfully');
   } catch (error) {
     console.error('Error generating analytics:', error);
@@ -1257,6 +1289,7 @@ router.get('/projects', async (req: AuthenticatedRequest, res: Response) => {
         name: users.name,
         email: users.email,
         payment: shootMembers.payment,
+        amountPaid: shootMembers.amountPaid,
         paymentStatus: shootMembers.paymentStatus,
         invited: shootMembers.invited,
       })
@@ -1376,6 +1409,7 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
         name: users.name,
         email: users.email,
         payment: shootMembers.payment,
+        amountPaid: shootMembers.amountPaid,
         paymentStatus: shootMembers.paymentStatus,
         invited: shootMembers.invited,
       })
@@ -1389,14 +1423,27 @@ router.get('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       .where(eq(shootMilestones.projectId, id));
 
     const isOwner = projectData.project.ownerId === userId;
+    // Owners see every payout; crew only ever get their own (stripProjectForMember
+    // blanks the rest), and never the client's payments.
+    const [payouts, payments] = await Promise.all([
+      members.length
+        ? db.select().from(crewPayouts).where(inArray(crewPayouts.shootMemberId, members.map((m) => m.id)))
+        : Promise.resolve([] as (typeof crewPayouts.$inferSelect)[]),
+      isOwner
+        ? db.select().from(clientPayments).where(eq(clientPayments.projectId, id))
+        : Promise.resolve([] as (typeof clientPayments.$inferSelect)[]),
+    ]);
+    const membersWithPayouts = members.map((m) => ({ ...m, payouts: payouts.filter((p) => p.shootMemberId === m.id) }));
+
     let shapedProject = shapeProject(
       projectData.project,
       projectData.ownerName || projectData.ownerEmail || projectData.project.ownerId,
       projectData.ownerEmail ?? '',
       days,
       exps,
-      members,
-      milestones
+      membersWithPayouts,
+      milestones,
+      payments
     );
 
     if (!isOwner) {
@@ -1436,6 +1483,13 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
       return sendError(res, 404, { code: 'NOT_FOUND', message: 'Project not found' });
     }
 
+    // A new budget can make received money "in full" or no longer so.
+    if (body.budget !== undefined && updatedProject.amountReceived > 0) {
+      await recomputeProject(id);
+      const [fresh] = await db.select().from(projects).where(eq(projects.id, id)).limit(1);
+      Object.assign(updatedProject, fresh);
+    }
+
     // Re-fetch shoot days to return a fully shaped project
     const days = await db
       .select()
@@ -1462,6 +1516,7 @@ router.put('/projects/:id', async (req: AuthenticatedRequest, res: Response) => 
         name: users.name,
         email: users.email,
         payment: shootMembers.payment,
+        amountPaid: shootMembers.amountPaid,
         paymentStatus: shootMembers.paymentStatus,
         invited: shootMembers.invited,
       })
@@ -1834,6 +1889,162 @@ router.post('/projects/:projectId/share/reset', async (req: AuthenticatedRequest
   }
 });
 
+// ─── Part payments ──────────────────────────────────────────────────────────
+// Money in from the client and out to crew, one row per payment. Adding or
+// removing a row and recomputing the totals/status is a single transaction.
+
+/** One crew member in the API shape, with their payouts. */
+async function loadMember(memberId: string) {
+  const [row] = await db
+    .select({
+      id: shootMembers.id,
+      userId: shootMembers.userId,
+      name: users.name,
+      email: users.email,
+      payment: shootMembers.payment,
+      amountPaid: shootMembers.amountPaid,
+      paymentStatus: shootMembers.paymentStatus,
+      invited: shootMembers.invited,
+    })
+    .from(shootMembers)
+    .leftJoin(users, eq(shootMembers.userId, users.id))
+    .where(eq(shootMembers.id, memberId))
+    .limit(1);
+  const payouts = await db.select().from(crewPayouts).where(eq(crewPayouts.shootMemberId, memberId));
+  return shapeTeamMember({ ...row, payouts });
+}
+
+/** The project's money-in summary after a change. */
+async function loadReceipts(projectId: string) {
+  const [[p], rows] = await Promise.all([
+    db.select({ amountReceived: projects.amountReceived, status: projects.status, budget: projects.budget })
+      .from(projects).where(eq(projects.id, projectId)).limit(1),
+    db.select().from(clientPayments).where(eq(clientPayments.projectId, projectId)),
+  ]);
+  return {
+    amountReceived: p.amountReceived,
+    status: p.status,
+    budget: p.budget,
+    clientPayments: rows
+      .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.getTime() - a.createdAt.getTime())
+      .map(shapeClientPayment),
+  };
+}
+
+// POST /projects/:projectId/client-payments — record money received from the client
+router.post('/projects/:projectId/client-payments', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const { fields, value } = validatePaymentEntry(req.body ?? {});
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    await db.batch([
+      db.insert(clientPayments).values({ projectId, ...value }),
+      recomputeProject(projectId),
+    ]);
+    return sendSuccess(res, 201, await loadReceipts(projectId), 'Payment recorded');
+  } catch (error) {
+    console.error('Error recording client payment:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to record payment' });
+  }
+});
+
+// DELETE /projects/:projectId/client-payments/:paymentId
+router.delete('/projects/:projectId/client-payments/:paymentId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const paymentId = String(req.params.paymentId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const [deleted] = await db.batch([
+      db.delete(clientPayments)
+        .where(and(eq(clientPayments.id, paymentId), eq(clientPayments.projectId, projectId)))
+        .returning({ id: clientPayments.id }),
+      recomputeProject(projectId),
+    ]);
+    if (deleted.length === 0) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Payment not found' });
+    return sendSuccess(res, 200, await loadReceipts(projectId), 'Payment removed');
+  } catch (error) {
+    console.error('Error deleting client payment:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to remove payment' });
+  }
+});
+
+// POST /projects/:projectId/members/:memberId/payouts — pay a crew member (in full or in part)
+router.post('/projects/:projectId/members/:memberId/payouts', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const memberId = String(req.params.memberId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const { fields, value } = validatePaymentEntry(req.body ?? {});
+    if (Object.keys(fields).length > 0) return validationError(res, fields);
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const [member] = await db.select().from(shootMembers)
+      .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId))).limit(1);
+    if (!member) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Member not found' });
+
+    const remaining = member.payment - member.amountPaid;
+    if (member.payment === 0) return validationError(res, { amount: 'Set a fee for this member first' });
+    if (value.amount > remaining) {
+      return validationError(res, { amount: remaining > 0 ? `Only ${remaining} is left to pay on this fee` : 'This fee is already paid in full' });
+    }
+
+    await db.batch([
+      db.insert(crewPayouts).values({ shootMemberId: memberId, ...value }),
+      recomputeMember(memberId),
+    ]);
+    return sendSuccess(res, 201, { member: await loadMember(memberId) }, 'Payout recorded');
+  } catch (error) {
+    console.error('Error recording crew payout:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to record payout' });
+  }
+});
+
+// DELETE /projects/:projectId/members/:memberId/payouts/:payoutId
+router.delete('/projects/:projectId/members/:memberId/payouts/:payoutId', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const projectId = String(req.params.projectId);
+    const memberId = String(req.params.memberId);
+    const payoutId = String(req.params.payoutId);
+    if (!userId) return sendError(res, 401, { code: 'UNAUTHORIZED', message: 'Unauthorized' });
+
+    const project = await requireProjectOwner(projectId, userId, res);
+    if (!project) return;
+
+    const [member] = await db.select({ id: shootMembers.id }).from(shootMembers)
+      .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId))).limit(1);
+    if (!member) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Member not found' });
+
+    const [deleted] = await db.batch([
+      db.delete(crewPayouts)
+        .where(and(eq(crewPayouts.id, payoutId), eq(crewPayouts.shootMemberId, memberId)))
+        .returning({ id: crewPayouts.id }),
+      recomputeMember(memberId),
+    ]);
+    if (deleted.length === 0) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Payout not found' });
+    return sendSuccess(res, 200, { member: await loadMember(memberId) }, 'Payout removed');
+  } catch (error) {
+    console.error('Error deleting crew payout:', error);
+    return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to remove payout' });
+  }
+});
+
 // ─── Bulk edit ──────────────────────────────────────────────────────────────
 
 // PUT /projects/:projectId/edits — everything the shoot detail screen's Save
@@ -1939,17 +2150,29 @@ router.put('/projects/:projectId/edits', async (req: AuthenticatedRequest, res: 
     if (deletedMemberIds.length) {
       statements.push(db.delete(shootMembers).where(and(eq(shootMembers.projectId, projectId), inArray(shootMembers.id, deletedMemberIds))));
     }
-    for (const m of updatedMembers) {
-      statements.push(
-        db.update(shootMembers)
-          .set({ ...memberUpdateValues(m), updatedAt: now })
-          .where(and(eq(shootMembers.id, m.id as string), eq(shootMembers.projectId, projectId)))
-      );
+    if (updatedMembers.length) {
+      const current = await db.select().from(shootMembers).where(and(
+        eq(shootMembers.projectId, projectId),
+        inArray(shootMembers.id, updatedMembers.map((m) => m.id as string)),
+      ));
+      for (const m of updatedMembers) {
+        const row = current.find((r) => r.id === m.id);
+        if (!row) continue;
+        const change = memberChange(row, m);
+        if ('error' in change) {
+          return validationError(res, { [`members.updated[${updatedMembers.indexOf(m)}].payment`]: change.error });
+        }
+        statements.push(...change.statements);
+        if (m.invited !== undefined) {
+          statements.push(db.update(shootMembers).set({ invited: m.invited as boolean }).where(eq(shootMembers.id, row.id)));
+        }
+      }
     }
 
     statements.push(
       db.update(projects).set({ ...projectUpdateValues(projectBody), updatedAt: now }).where(eq(projects.id, projectId))
     );
+    if (projectBody.budget !== undefined && project.amountReceived > 0) statements.push(recomputeProject(projectId));
 
     await db.batch(statements as [BatchItem<'pg'>, ...BatchItem<'pg'>[]]);
 
@@ -2060,6 +2283,7 @@ router.post('/projects/:projectId/members', invitesByAccount, async (req: Authen
         name: targetUser.name || null,
         email: targetUser.email,
         payment: newMember.payment,
+        amountPaid: newMember.amountPaid,
         paymentStatus: newMember.paymentStatus,
         invited: newMember.invited,
       }));
@@ -2087,32 +2311,19 @@ router.put('/projects/:projectId/members/:memberId', async (req: AuthenticatedRe
     const fields = validateMemberFields(body);
     if (Object.keys(fields).length > 0) return validationError(res, fields);
 
-    const [updatedMember] = await db.update(shootMembers)
-      .set({ ...memberUpdateValues(body), updatedAt: new Date() })
-      .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId)))
-      .returning();
+    const [member] = await db.select().from(shootMembers)
+      .where(and(eq(shootMembers.id, memberId), eq(shootMembers.projectId, projectId))).limit(1);
+    if (!member) return sendError(res, 404, { code: 'NOT_FOUND', message: 'Member not found' });
 
-    if (!updatedMember) {
-      return sendError(res, 404, { code: 'NOT_FOUND', message: 'Member not found' });
+    const change = memberChange(member, body);
+    if ('error' in change) return validationError(res, { payment: change.error });
+    const statements: BatchItem<'pg'>[] = [...change.statements];
+    if (body.invited !== undefined) {
+      statements.push(db.update(shootMembers).set({ invited: body.invited as boolean }).where(eq(shootMembers.id, memberId)));
     }
+    await db.batch(statements as [BatchItem<'pg'>, ...BatchItem<'pg'>[]]);
 
-    // Fetch user details for response
-    const [user] = await db.select({
-      name: users.name,
-      email: users.email,
-    }).from(users).where(eq(users.id, updatedMember.userId!)).limit(1);
-
-    const shapedMember = shapeTeamMember({
-      id: updatedMember.id,
-      userId: updatedMember.userId,
-      name: user?.name || null,
-      email: user?.email ?? '',
-      payment: updatedMember.payment,
-      paymentStatus: updatedMember.paymentStatus,
-      invited: updatedMember.invited,
-    });
-
-    return sendSuccess(res, 200, { member: shapedMember }, 'Team member updated successfully');
+    return sendSuccess(res, 200, { member: await loadMember(memberId) }, 'Team member updated successfully');
   } catch (error) {
     console.error('Error updating project member:', error);
     return sendError(res, 500, { code: 'INTERNAL_SERVER_ERROR', message: 'Failed to update project member' });

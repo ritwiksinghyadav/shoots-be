@@ -7,7 +7,9 @@
 /** Upper bound for any single money value; well inside int4 (2,147,483,647). */
 export const MAX_MONEY = 2_000_000_000;
 
-export const PAYMENT_STATUSES = ['paid', 'unpaid'] as const;
+// 'partial' is accepted as input meaning "leave the payouts as they are"; it's
+// derived from payouts, so sending it never changes anything on its own.
+export const PAYMENT_STATUSES = ['paid', 'partial', 'unpaid'] as const;
 export type PaymentStatusValue = (typeof PAYMENT_STATUSES)[number];
 
 /** Whole number from 0 to MAX_MONEY, given as a number or numeric string. */

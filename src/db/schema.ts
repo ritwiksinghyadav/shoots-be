@@ -117,6 +117,12 @@ export const projects = pgTable('projects', {
    */
   shareToken: text('share_token').unique(),
   shareEnabled: boolean('share_enabled').notNull().default(false),
+  /**
+   * Sum of `client_payments.amount` for this project, in major units. Kept in
+   * step by the same statement that adds or removes a payment
+   * (utils/money.ts), so lists can show "received / due" without a join.
+   */
+  amountReceived: integer('amount_received').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: updatedAt(),
 }, (table) => [
@@ -155,11 +161,18 @@ export const shootMembers = pgTable('shoot_members', {
   id: uuid('id').defaultRandom().primaryKey(),
   projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   userId: uuid('user_id').references(() => users.id, { onDelete: 'set null' }),
+  /**
+   * 'unpaid' | 'partial' | 'paid', derived from `amountPaid` against `payment`
+   * whenever either changes (utils/money.ts). The one exception is a ₹0 fee,
+   * where 'paid'/'unpaid' is set by hand because there's nothing to pay out.
+   */
   paymentStatus: text('payment_status').notNull().default('unpaid'),
   /**
-   * Payment stored in major currency units (e.g. dollars, euros), not cents.
+   * The agreed fee, in major currency units (e.g. dollars, euros), not cents.
    */
   payment: integer('payment').notNull().default(0),
+  /** Sum of this member's `crew_payouts.amount`. Never more than `payment`. */
+  amountPaid: integer('amount_paid').notNull().default(0),
   invited: boolean('invited').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: updatedAt(),
@@ -255,4 +268,41 @@ export const payments = pgTable('payments', {
 }, (table) => [
   index('payments_user_created_idx').on(table.userId, table.createdAt),
   index('payments_status_idx').on(table.status),
+]);
+
+/**
+ * Money received from the client for a project: advances, part payments and
+ * the final settlement, one row each. `projects.amountReceived` is their sum.
+ * Amounts are whole major units, like every other project money column.
+ */
+export const clientPayments = pgTable('client_payments', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+  amount: integer('amount').notNull(),
+  /** YYYY-MM-DD the money came in. */
+  date: text('date').notNull(),
+  /** 'upi' | 'cash' | 'bank' | 'card' | 'cheque' | 'other', or null if not recorded. */
+  method: text('method'),
+  note: text('note'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('client_payments_project_idx').on(table.projectId),
+]);
+
+/**
+ * Money paid to a crew member for one project, in instalments.
+ * `shoot_members.amountPaid` is their sum.
+ */
+export const crewPayouts = pgTable('crew_payouts', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  shootMemberId: uuid('shoot_member_id').notNull().references(() => shootMembers.id, { onDelete: 'cascade' }),
+  amount: integer('amount').notNull(),
+  /** YYYY-MM-DD the money was paid. */
+  date: text('date').notNull(),
+  /** Same values as client_payments.method. */
+  method: text('method'),
+  note: text('note'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('crew_payouts_member_idx').on(table.shootMemberId),
 ]);
